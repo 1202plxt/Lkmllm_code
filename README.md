@@ -45,6 +45,22 @@ pip install -r requirements.txt
 
 ## 数据和权重准备
 
+**初始化目录结构**（在 `Lkmllm_code/` 下执行，一次性创建所有目录）：
+
+```bash
+mkdir -p ../Lkmllm_data/datasets/Train \
+         ../Lkmllm_data/datasets/Test \
+         ../Lkmllm_data/checkpoints \
+         ../Lkmllm_data/outputs/startend_gradient_head_attr \
+         ../Lkmllm_data/logs \
+         ../Lkmllm_data/visualizations \
+         ../Lkmllm_data/cache \
+         ../Lkmllm_data/pretrained \
+         ../shared_models
+```
+
+（`datasets/Train`、`datasets/Test` 下的具体子目录如 `timelens-100k`、`Charades_sta` 由下载/整理脚本自动生成，无需手动建。）
+
 | 资源 | 放置路径 | 获取方式 | 用途 |
 | --- | --- | --- | --- |
 | TimeLens 训练集 | `../Lkmllm_data/datasets/Train/timelens-100k/` | ModelScope `StudyAI123123/timelens-100k` + `tools/organize_timelens.py` 整理 | 训练 |
@@ -63,6 +79,13 @@ python tools/organize_timelens.py
 
 # 基础模型
 modelscope download --model Qwen/Qwen3-VL-8B-Instruct --local_dir ../shared_models/Qwen3-VL-8B-Instruct
+```
+
+> 若 head 归因结果 json 已生成、但放在了 `Lkmllm_code/` 根目录（`startend_gradient_head_attribution.json`），把它移到正确位置（在 `Lkmllm_code/` 下执行）：
+
+```bash
+mkdir -p ../Lkmllm_data/outputs/startend_gradient_head_attr
+cp startend_gradient_head_attribution.json ../Lkmllm_data/outputs/startend_gradient_head_attr/
 ```
 
 ## 训练
