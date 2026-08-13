@@ -1,1 +1,121 @@
-# Lkmllm_code
+# LK_OPD
+
+## 项目简介
+
+TimeLens 视频时序定位（Video Temporal Grounding）微调：基于 Qwen3-VL-8B-Instruct，先对 start/end 时间数字 token 做梯度归因选出关键 attention head，再用 Layer LoRA + Attention Alignment 辅助 loss 微调，让模型定位事件发生的起止时间段（秒）。
+
+## 目录说明
+
+**所有命令都从 `Lkmllm_code/` 目录执行**（`cd Lkmllm_code`）。代码内部以 `Lkmllm_code/` 为项目根（见 `src/project_paths.py`），数据与权重是它的兄弟目录，访问时用 `../` 前缀：
+
+- `Lkmllm_code/`：代码与脚本（执行目录）
+  - `scripts/`：训练 / 归因脚本
+  - `src/project_paths.py`：路径解析（以 `Lkmllm_code/` 为根）
+  - `tools/organize_timelens.py`：数据集整理
+- `../Lkmllm_data/`：数据与产物
+  - `datasets/`：数据集（`Train/`、`Test/`）
+  - `checkpoints/`：训练权重与 LoRA 产物
+  - `outputs/`：head 归因结果、评测输出
+  - `logs/`、`visualizations/`、`cache/`、`pretrained/`
+- `../shared_models/`：基础模型权重（Qwen3-VL-8B-Instruct）
+
+三者关系：`Lkmllm_code/` 与 `Lkmllm_data/`、`shared_models/` 在工作区根（`LK_OPD/`）下平级。`project_paths.py` 以 `Lkmllm_code/` 为根，数据/模型取它的兄弟目录；因此即使 `shared_models/` 还没建，代码也能正常定位（不会再报 `Could not locate project root`），只有真正加载模型时才需要权重就位。
+
+## 环境配置
+
+```bash
+conda create -n qwen3vl python=3.11 -y
+conda activate qwen3vl
+cd Lkmllm_code
+pip install -r requirements.txt
+```
+
+特殊版本要求（不匹配会导致加载/训练失败）：
+
+- **CUDA 12.4**、**PyTorch 2.6.0+cu124**（requirements.txt 已带官方 cu124 源）
+- **transformers 5.14.1**、**qwen-vl-utils 0.0.14**、**decord 0.6.0**
+- **flash-attn 2.7.4.post1**（可选，加速注意力）：必须装 `cu12torch2.6` 的 wheel 匹配 torch + Python 3.11：
+
+  ```bash
+  pip install https://github.com/Dao-AILab/flash-attention/releases/download/v2.7.4.post1/flash_attn-2.7.4.post1+cu12torch2.6cxx11abiFALSE-cp311-cp311-linux_x86_64.whl
+  ```
+
+  装不上就删掉命令里的 `--attn-implementation flash_attention_2`，脚本自动降级 sdpa（略慢但稳定）。
+- 本项目**不依赖 vLLM / deepspeed**；多卡用 torch 自带的 `torchrun` + DDP（`accelerate` 已不再用于启动）。
+
+## 数据和权重准备
+
+| 资源 | 放置路径 | 获取方式 | 用途 |
+| --- | --- | --- | --- |
+| TimeLens 训练集 | `../Lkmllm_data/datasets/Train/timelens-100k/` | ModelScope `StudyAI123123/timelens-100k` + `tools/organize_timelens.py` 整理 | 训练 |
+| 基础模型 | `../shared_models/Qwen3-VL-8B-Instruct` | ModelScope `Qwen/Qwen3-VL-8B-Instruct` | backbone |
+| head 归因结果 | `../Lkmllm_data/outputs/startend_gradient_head_attr/startend_gradient_head_attribution.json` | 脚本 `d_startend_gradient_head_attribution.py` 生成 | 训练时 `--attr-json` |
+| 微调产物 | `../Lkmllm_data/checkpoints/lora_layer/` | 训练生成 | 继续训练 / 推理 |
+
+下载命令（在 `Lkmllm_code/` 下执行）：
+
+```bash
+pip install modelscope
+
+# 数据集（下载到工作区根，再整理到 ../Lkmllm_data）
+modelscope download --dataset 'StudyAI123123/timelens-100k' --local_dir ../timelens-100k
+python tools/organize_timelens.py
+
+# 基础模型
+modelscope download --model Qwen/Qwen3-VL-8B-Instruct --local_dir ../shared_models/Qwen3-VL-8B-Instruct
+```
+
+## 训练
+
+### 1. Head 归因（训练前，生成 `--attr-json`）
+
+```bash
+python scripts/d_startend_gradient_head_attribution.py \
+  --filtered-json ../Lkmllm_data/datasets/Test/Charades_sta/charades-timelens.json \
+  --model-path ../shared_models/Qwen3-VL-8B-Instruct \
+  --video-dir ../Lkmllm_data/datasets/Test/Charades_sta/charades \
+  --output-dir ../Lkmllm_data/outputs/startend_gradient_head_attr \
+  --max-samples 100 --top-k 30 --fps 0.5 --max-side 224 --layers-per-batch 6
+```
+
+输出 `startend_gradient_head_attribution.json`（top-k head + 分数）。若该文件已存在可跳过此步。
+
+### 2. LoRA 微调（多卡）
+
+```bash
+NUM_GPUS=$(nvidia-smi -L | wc -l)
+torchrun --nproc_per_node=${NUM_GPUS} \
+  scripts/heads_finetune_layer_lora_attn_align.py \
+  --attr-json  ../Lkmllm_data/outputs/startend_gradient_head_attr/startend_gradient_head_attribution.json \
+  --model-path ../shared_models/Qwen3-VL-8B-Instruct \
+  --anno-json  ../Lkmllm_data/datasets/Train/timelens-100k/timelens-100k.jsonl \
+  --video-dir  ../Lkmllm_data/datasets/Train/timelens-100k \
+  --output-dir ../Lkmllm_data/checkpoints/lora_layer \
+  --top-k 20 --align-top-n 20 --align-weight 0.1 --lr 1e-5 --epochs 10
+```
+
+## 评测
+
+暂无独立 eval 脚本。时序定位指标（MAE / IoU）的辅助函数在 `scripts/c_time_utils.py`：
+
+- `generate_prediction(model, processor, inputs)`：生成并解析起止时间
+- `compute_mae(pred, gt)` / `compute_iou(pred, gt)`：计算指标
+
+如需评测，基于这几个函数补一个 eval 脚本即可（TODO）。
+
+## 输出说明
+
+- **head 归因**：`../Lkmllm_data/outputs/startend_gradient_head_attr/startend_gradient_head_attribution.json`
+- **LoRA 权重**：`../Lkmllm_data/checkpoints/lora_layer/lora_layer_adapter.pt` + `config.json`
+- **合并后的完整模型**：`../Lkmllm_data/checkpoints/lora_layer/` 下的 `model.safetensors` 等（`save_pretrained` 写出，可直接加载做推理）
+- **断点续训**：`lora_layer_checkpoint.pt`（训练中周期性保存，正常结束后删除）
+- **跑成功的标志**：训练打印 `Epoch ... valid=... ce=... align=... total=...`，最后出现 `Merging LoRA...` 并在 output-dir 生成合并后的模型权重。
+
+## 常见问题
+
+- **缺数据**：`--anno-json` / `--video-dir` 指向不存在 → 确认已下载并整理 TimeLens 到 `../Lkmllm_data/datasets/Train/timelens-100k/`（含 `timelens-100k.jsonl` 和 5 个视频子目录）。
+- **缺权重**：`--model-path` 目录里没有 `config.json` / `*.safetensors` → 用 modelscope 下载到 `../shared_models/Qwen3-VL-8B-Instruct`。
+- **路径没设对**：所有 `--*` 相对路径都相对 `Lkmllm_code/`（执行目录）解析，不确定时直接写绝对路径。
+- **CUDA / torch / flash-attn 不匹配**：flash-attn 装不上或 import 报错时，删掉 `--attn-implementation flash_attention_2` 降级 sdpa。
+- **多卡没生效 / 报 NCCL 错误**：多卡必须用 `torchrun` 启动（不能 `python`）；NCCL 需要 NVIDIA GPU + Linux。
+- **OOM**：调低 `--max-side` / `--fps`（attention 显存与 seq_len 平方相关）、`--layers-per-batch`（归因脚本）、`--max-frames` / `--total-tokens`（微调脚本）。
