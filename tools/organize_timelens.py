@@ -13,16 +13,16 @@ organize_timelens.py — 把下载下来的 TimeLens-100K 数据集整理成项�
 
 用法（在项目根目录 LK_OPD 下运行）：
     # 默认整理项目根目录下的 timelens-100k（移动，不保留原下载目录）
-    python Lkmllm_code/tools/organize_timelens.py
+    python tools/organize_timelens.py
 
     # 指定其它下载位置
-    python Lkmllm_code/tools/organize_timelens.py --src /path/to/timelens-100k
+    python tools/organize_timelens.py --src /path/to/timelens-100k
 
     # 复制（保留原下载目录）
-    python Lkmllm_code/tools/organize_timelens.py --copy
+    python tools/organize_timelens.py --copy
 
     # 只预览要做什么，不实际执行
-    python Lkmllm_code/tools/organize_timelens.py --dry-run
+    python tools/organize_timelens.py --dry-run
 """
 
 from __future__ import annotations
