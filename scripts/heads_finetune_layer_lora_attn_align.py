@@ -4,8 +4,15 @@ heads_finetune_layer_lora_attn_align_multigpu.py
 
 基于 PyTorch DistributedDataParallel (DDP) 的多卡训练适配。
 启动方式：
-   torchrun --nproc_per_node=NUM_GPUS heads_finetune_layer_lora_attn_align_multigpu.py \
-       --attr-json ... --model-path ... --anno-json ... --video-dir ... --output-dir ...
+   torchrun --nproc_per_node=${NUM_GPUS} \
+  scripts/heads_finetune_layer_lora_attn_align.py \
+  --attr-json   ../Lkmllm_data/outputs/startend_gradient_head_attr/startend_gradient_head_attribution.json \
+  --model-path  ../shared_models/Qwen3-VL-8B-Instruct \
+  --anno-json   ../Lkmllm_data/datasets/Train/timelens-100k/timelens-100k.jsonl \
+  --video-dir   ../Lkmllm_data/datasets/Train/timelens-100k \
+  --output-dir  ../Lkmllm_data/checkpoints/lora_layer \
+  --top-k 20 --align-top-n 20 --align-weight 0.1 \
+  --lr 1e-5 --epochs 10
 """
 from __future__ import annotations
 
