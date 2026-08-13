@@ -1,0 +1,32 @@
+# ============================================================
+# LK_OPD 微调环境依赖（Python 3.11 / CUDA 12.4 / conda 环境 qwen3vl）
+# 版本来自 worker-0 节点实际环境，2026-08-13 用 `pip freeze` 采集
+# 直接安装：pip install -r requirements.txt
+# ============================================================
+
+# PyTorch（CUDA 12.4 版，带 +cu124 后缀的版本只能从官方源装，故额外指定 index）
+--extra-index-url https://download.pytorch.org/whl/cu124
+torch==2.6.0+cu124
+torchvision==0.21.0+cu124
+torchaudio==2.6.0+cu124
+
+transformers==5.14.1
+accelerate==1.14.0
+qwen-vl-utils==0.0.14
+decord==0.6.0
+numpy==2.4.4
+pillow==12.2.0
+safetensors==0.8.0
+tokenizers==0.22.2
+matplotlib==3.11.1
+modelscope==1.38.1
+
+# ---- 可选：flash-attn 加速注意力 ----
+# flash-attn 的 wheel 按 torch/CUDA/Python ABI 编译，必须与 torch 严格匹配。
+# 本机 torch==2.6.0+cu124 + Python 3.11，应装 cu12torch2.6 的 wheel（版本仍为 2.7.4.post1）：
+#   pip install https://github.com/Dao-AILab/flash-attention/releases/download/v2.7.4.post1/flash_attn-2.7.4.post1+cu12torch2.6cxx11abiFALSE-cp311-cp311-linux_x86_64.whl
+# 装不上可省略，脚本会自动降级为 sdpa。
+flash-attn==2.7.4.post1
+
+# ---- 开发/测试 ----
+pytest
