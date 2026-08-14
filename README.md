@@ -172,7 +172,7 @@ torchrun --nproc_per_node=${NUM_GPUS} \
 
 ## 评测
 
-评测脚本 `scripts/e_head_eval.py`（纯 generate 路径，多卡数据并行）。**采样/编码参数必须和训练完全一致**，否则 IoU 会掉到接近随机：默认已对齐训练（`--fps 2 --max-frames 200 --min-tokens 16 --total-tokens 3584 --attn-implementation flash_attention_2`），无需显式传；若训练时改过这些值，评测也要传同样的值。
+评测脚本 `scripts/e_head_eval.py`（纯 generate 路径，多卡数据并行）。**采样/编码参数必须和训练完全一致**，否则 IoU 会掉到接近随机：默认已对齐训练（`--fps 2 --max-frames 200 --min-tokens 64 --total-tokens 14336 --attn-implementation flash_attention_2`），无需显式传；若训练时改过这些值，评测也要传同样的值。
 
 ```bash
 # top-K HeadLoRA（微调后主实验）
@@ -201,6 +201,7 @@ python scripts/e_head_eval.py \
 - QVHighlights：`../Lkmllm_data/datasets/Test/Qvhighlights/qvhighlights-timelens.json` + `.../Qvhighlights/qvhighlights`
 
 输出（在 `--output-dir` 下）：`metrics_<split>.json`（`mIoU` + `R@1_IoU0.3/0.5/0.7`）、`details_<split>.jsonl`（逐条预测）、`failures_<split>.jsonl`（零 IoU 的 badcase）。
+
 
 ## 输出说明
 
