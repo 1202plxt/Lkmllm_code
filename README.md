@@ -64,6 +64,7 @@ mkdir -p ../Lkmllm_data/datasets/Train \
 | 资源 | 放置路径 | 获取方式 | 用途 |
 | --- | --- | --- | --- |
 | TimeLens 训练集 | `../Lkmllm_data/datasets/Train/timelens-100k/` | ModelScope `StudyAI123123/timelens-100k` + `tools/organize_timelens.py` 整理 | 训练 |
+| TimeLens 测试集 | `../Lkmllm_data/datasets/Test/`（`Charades_sta/`、`Activitynet/`、`Qvhighlights/`） | HuggingFace `TencentARC/TimeLens-Bench` | head 归因 / 评测 |
 | 基础模型 | `../shared_models/Qwen3-VL-8B-Instruct` | ModelScope `Qwen/Qwen3-VL-8B-Instruct` | backbone |
 | head 归因结果 | `../Lkmllm_data/outputs/startend_gradient_head_attr/startend_gradient_head_attribution.json` | 脚本 `d_startend_gradient_head_attribution.py` 生成 | 训练时 `--attr-json` |
 | 微调产物 | `../Lkmllm_data/checkpoints/lora_layer/` | 训练生成 | 继续训练 / 推理 |
@@ -72,13 +73,33 @@ mkdir -p ../Lkmllm_data/datasets/Train \
 
 ```bash
 pip install modelscope
+pip install -U "huggingface_hub[cli]"
 
-# 数据集（下载到工作区根，再整理到 ../Lkmllm_data）
+# 训练集（下载到工作区根 → 解压 → 整理到 ../Lkmllm_data）
 modelscope download --dataset 'StudyAI123123/timelens-100k' --local_dir ../timelens-100k
+(cd ../timelens-100k && unzip *.zip)
 python tools/organize_timelens.py
+
+# 测试集（Charades-STA / ActivityNet / QVHighlights，HuggingFace TimeLens-Bench）
+huggingface-cli download TencentARC/TimeLens-Bench --repo-type dataset --local-dir ../Lkmllm_data/datasets/Test
 
 # 基础模型
 modelscope download --model Qwen/Qwen3-VL-8B-Instruct --local_dir ../shared_models/Qwen3-VL-8B-Instruct
+```
+
+测试集下载后，`../Lkmllm_data/datasets/Test/` 下应保持以下结构（每个子数据集 = 视频目录 + `*-timelens.json` 标注）：
+
+```text
+Test/
+├── Activitynet/
+│   ├── activitynet/              # 视频
+│   └── activitynet-timelens.json
+├── Charades_sta/
+│   ├── charades/                 # 视频
+│   └── charades-timelens.json
+└── Qvhighlights/
+    ├── qvhighlights/             # 视频
+    └── qvhighlights-timelens.json
 ```
 
 > 若 head 归因结果 json 已生成、但放在了 `Lkmllm_code/` 根目录（`startend_gradient_head_attribution.json`），把它移到正确位置（在 `Lkmllm_code/` 下执行）：
