@@ -6,7 +6,7 @@ e_head_eval.py — HeadLoRA 微调模型的 Temporal Grounding 评估
    "视频"和训练时不是一回事（帧数、每帧分辨率、时间戳节奏、attention 数值
    实现都会变），IoU 会直接掉到接近随机猜的水平。默认值全部对齐训练：
 
-     训练默认: --fps 2.0 --max-frames 200 --min-tokens 16 --total-tokens 3584
+     训练默认: --fps 2.0 --max-frames 200 --min-tokens 64 --total-tokens 14336
               --attn-implementation flash_attention_2
      评测默认: 同上
 
@@ -132,10 +132,10 @@ def build_parser() -> argparse.ArgumentParser:
                    help="0 表示 greedy decoding (确定性、可复现)；> 0 会走采样")
 
     # Token 预算 (和训练一致，是决定 IoU 的关键路径)
-    p.add_argument("--min-tokens",   type=int, default=16,
-                   help="和训练 --min-tokens 保持一致 (训练默认 16)")
-    p.add_argument("--total-tokens", type=int, default=3584,
-                   help="和训练 --total-tokens 保持一致 (训练默认 3584)。"
+    p.add_argument("--min-tokens",   type=int, default=64,
+                   help="和训练 --min-tokens 保持一致 (训练默认 64，TimeLens 标准)")
+    p.add_argument("--total-tokens", type=int, default=14336,
+                   help="和训练 --total-tokens 保持一致 (训练默认 14336，TimeLens 标准)。"
                         "≤0 时降级到旧的 max-size resize 路径 (不推荐)。")
 
     # attention 实现 - 默认对齐训练 (flash_attention_2)，
@@ -862,8 +862,8 @@ def main(argv=None):
     print("\n[对齐训练的采样/编码参数]")
     print(f"  fps            = {args.fps}   (训练默认 2.0)")
     print(f"  max_frames     = {args.max_frames}   (训练默认 200)")
-    print(f"  min_tokens     = {args.min_tokens}   (训练默认 16)")
-    print(f"  total_tokens   = {args.total_tokens}   (训练默认 3584)")
+    print(f"  min_tokens     = {args.min_tokens}   (训练默认 64)")
+    print(f"  total_tokens   = {args.total_tokens}   (训练默认 14336)")
     print(f"  attn_impl      = {args.attn_implementation}   (训练默认 flash_attention_2)")
     if args.total_tokens <= 0:
         print(f"  [WARN] total_tokens<=0，走 max-size={args.max_size} 的旧路径，"
