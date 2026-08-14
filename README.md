@@ -1,4 +1,4 @@
-# LK_OPD
+# Lkmllm_code
 
 ## 项目简介
 
@@ -87,19 +87,21 @@ hf download TencentARC/TimeLens-Bench --repo-type=dataset --local-dir ../Lkmllm_
 modelscope download --model Qwen/Qwen3-VL-8B-Instruct --local_dir ../shared_models/Qwen3-VL-8B-Instruct
 ```
 
-测试集下载后，`Test/` 下是 `TimeLens-Bench/`，内含 `video_shards/`（三个视频文件夹）+ 三个 `*-timelens.json` 标注。需把它们拆开、与对应 json 放在同一个数据集目录下（`TimeLens-Bench/` 和 `video_shards/` 都不要）：
+测试集下载后，`Test/` 下是 `TimeLens-Bench/`，内含 `video_shards/`（三个数据集的 `.tar.gz` 视频分片）+ 三个 `*-timelens.json` 标注。需**先解压视频分片**，再和对应 json 放到同一个数据集目录下（`TimeLens-Bench/` 和 `video_shards/` 都不要）：
 
 ```bash
 (cd ../Lkmllm_data/datasets/Test && \
-  mkdir -p Activitynet Charades_sta Qvhighlights && \
-  mv TimeLens-Bench/video_shards/activitynet   Activitynet/activitynet && \
-  mv TimeLens-Bench/video_shards/charades      Charades_sta/charades && \
-  mv TimeLens-Bench/video_shards/qvhighlights  Qvhighlights/qvhighlights && \
+  mkdir -p Activitynet/activitynet Charades_sta/charades Qvhighlights/qvhighlights && \
+  find TimeLens-Bench/video_shards/activitynet  -name "*.tar.gz" -exec tar -xzf {} -C Activitynet/activitynet  \; && \
+  find TimeLens-Bench/video_shards/charades     -name "*.tar.gz" -exec tar -xzf {} -C Charades_sta/charades     \; && \
+  find TimeLens-Bench/video_shards/qvhighlights -name "*.tar.gz" -exec tar -xzf {} -C Qvhighlights/qvhighlights \; && \
   mv TimeLens-Bench/activitynet-timelens.json  Activitynet/ && \
   mv TimeLens-Bench/charades-timelens.json     Charades_sta/ && \
   mv TimeLens-Bench/qvhighlights-timelens.json Qvhighlights/ && \
   rm -rf TimeLens-Bench)
 ```
+
+> 解压后如果某个 `.tar.gz` 里还套了一层同名目录（如变成 `Activitynet/activitynet/activitynet/xxx.mp4`），给上面的 `tar -xzf {}` 加 `--strip-components=1` 再跑一次。若你的下载里 `video_shards/` 是平铺的 `*.tar.gz`（没有三个子目录），把三个 `find TimeLens-Bench/video_shards/activitynet ...` 路径改成 `find TimeLens-Bench/video_shards -path "*activitynet*" -name "*.tar.gz" ...`（charades / qvhighlights 同理）。
 
 整理后的最终结构（每个子数据集 = 视频目录 + `*-timelens.json` 标注）：
 
@@ -141,7 +143,9 @@ python scripts/d_startend_gradient_head_attribution.py \
 
 输出 `startend_gradient_head_attribution.json`（含 `top_k_heads`、`combined_score_matrix`，以及 grad-only / attn-only 两条独立排名列表）。若该文件已存在可跳过此步。
 
-> 显存不足时：优先调低 `--fps` / `--max-side`（attention 显存随 seq_len 平方增长）、`--layers-per-batch`（36 层分批数）；`--gpu-mem-gib` 是每张 GPU 给模型的显存上限（默认 16 GiB），超出的层溢出到 CPU（`--cpu-mem-gib` 默认 64 GiB）。
+> **TimeLens 标准采样参数**：脚本已直接暴露官方参数，与 TimeLens 一一对应（[TimeLens-7B](https://huggingface.co/TencentARC/TimeLens-7B) / [TimeLens-8B](https://huggingface.co/TencentARC/TimeLens-8B)）——`--fps 2`（官方 FPS=2）、`--min-tokens 64`（官方 min_tokens=64）、`--max-tokens 14336`（官方 total_tokens=14336）。`--max-side` 默认 `None`，不再强制 resize，每帧分辨率/token 数完全交给 processor 按 `min_tokens`/`max_tokens` 预算自适应控制。归因默认跑训练集（`timelens-100k`），与微调数据同分布，选出的 head 更贴合后续训练。
+
+> **显存 / 多卡**：脚本是多卡数据并行——`--num-gpus` 默认 0（自动检测所有可用 GPU），每张卡加载**一个完整模型副本**（`device_map={"": cuda:N}`，不做跨卡分片），样本均匀分配后各卡独立归因、主进程汇总。因此**每张卡需约 16–18 GiB 显存放 8B bf16 权重**（再加 attention 显存）。旧的 `--gpu-mem-gib` / `--cpu-mem-gib` 已不再使用。OOM 时：调低 `--max-tokens`（attention 显存随 seq_len 平方增长）、`--layers-per-batch`（36 层分批数），或 `--num-gpus 1` 退回单卡；`--min-attn-ratio` 是过滤基线，不影响显存。
 
 ### 2. LoRA 微调（多卡）
 
