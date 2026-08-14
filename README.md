@@ -81,13 +81,27 @@ modelscope download --dataset 'StudyAI123123/timelens-100k' --local_dir ../timel
 python tools/organize_timelens.py
 
 # 测试集（Charades-STA / ActivityNet / QVHighlights，HuggingFace TimeLens-Bench）
-huggingface-cli download TencentARC/TimeLens-Bench --repo-type dataset --local-dir ../Lkmllm_data/datasets/Test
+hf download TencentARC/TimeLens-Bench --repo-type=dataset --local-dir ../Lkmllm_data/datasets/Test
 
 # 基础模型
 modelscope download --model Qwen/Qwen3-VL-8B-Instruct --local_dir ../shared_models/Qwen3-VL-8B-Instruct
 ```
 
-测试集下载后，`../Lkmllm_data/datasets/Test/` 下应保持以下结构（每个子数据集 = 视频目录 + `*-timelens.json` 标注）：
+测试集下载后，`Test/` 下是 `video_shards/`（内含三个视频文件夹）+ 三个 `*-timelens.json` 标注。需把它们拆开、与对应 json 放在同一个数据集目录下（`video_shards/` 不要）：
+
+```bash
+(cd ../Lkmllm_data/datasets/Test && \
+  mkdir -p Activitynet Charades_sta Qvhighlights && \
+  mv video_shards/activitynet   Activitynet/activitynet && \
+  mv video_shards/charades      Charades_sta/charades && \
+  mv video_shards/qvhighlights  Qvhighlights/qvhighlights && \
+  mv activitynet-timelens.json  Activitynet/ && \
+  mv charades-timelens.json     Charades_sta/ && \
+  mv qvhighlights-timelens.json Qvhighlights/ && \
+  rmdir video_shards)
+```
+
+整理后的最终结构（每个子数据集 = 视频目录 + `*-timelens.json` 标注）：
 
 ```text
 Test/
