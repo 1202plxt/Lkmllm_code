@@ -133,10 +133,13 @@ python scripts/d_startend_gradient_head_attribution.py \
   --model-path ../shared_models/Qwen3-VL-8B-Instruct \
   --video-dir ../Lkmllm_data/datasets/Test/Charades_sta/charades \
   --output-dir ../Lkmllm_data/outputs/startend_gradient_head_attr \
-  --max-samples 100 --top-k 30 --fps 0.5 --max-side 224 --layers-per-batch 6
+  --max-samples 100 --top-k 30 --fps 0.5 --max-side 224 --layers-per-batch 6 \
+  --min-attn-ratio 1.0 --grad-only-top-k 30 --attn-only-top-k 30 --gpu-mem-gib 16
 ```
 
-输出 `startend_gradient_head_attribution.json`（top-k head + 分数）。若该文件已存在可跳过此步。
+输出 `startend_gradient_head_attribution.json`（含 `top_k_heads`、`combined_score_matrix`，以及 grad-only / attn-only 两条独立排名列表）。若该文件已存在可跳过此步。
+
+> 显存不足时：优先调低 `--fps` / `--max-side`（attention 显存随 seq_len 平方增长）、`--layers-per-batch`（36 层分批数）；`--gpu-mem-gib` 是每张 GPU 给模型的显存上限（默认 16 GiB），超出的层溢出到 CPU（`--cpu-mem-gib` 默认 64 GiB）。
 
 ### 2. LoRA 微调（多卡）
 
