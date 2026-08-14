@@ -133,8 +133,8 @@ python scripts/d_startend_gradient_head_attribution.py \
   --model-path ../shared_models/Qwen3-VL-8B-Instruct \
   --video-dir ../Lkmllm_data/datasets/Test/Charades_sta/charades \
   --output-dir ../Lkmllm_data/outputs/startend_gradient_head_attr \
-  --max-samples 100 --top-k 30 --fps 0.5 --max-side 224 --layers-per-batch 6 \
-  --min-attn-ratio 1.0 --grad-only-top-k 30 --attn-only-top-k 30 --gpu-mem-gib 16
+  --max-samples 100 --top-k 30 --fps 2 --max-side 224 --layers-per-batch 6 \
+  --min-attn-ratio 1.0 --grad-only-top-k 30 --attn-only-top-k 30 --gpu-mem-gib 30
 ```
 
 输出 `startend_gradient_head_attribution.json`（含 `top_k_heads`、`combined_score_matrix`，以及 grad-only / attn-only 两条独立排名列表）。若该文件已存在可跳过此步。
