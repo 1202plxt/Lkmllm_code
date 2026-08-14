@@ -90,15 +90,24 @@ modelscope download --model Qwen/Qwen3-VL-8B-Instruct --local_dir ../shared_mode
 测试集下载后，`Test/` 下是 `TimeLens-Bench/`，内含 `video_shards/`（三个数据集的 `.tar.gz` 视频分片）+ 三个 `*-timelens.json` 标注。需**先解压视频分片**，再和对应 json 放到同一个数据集目录下（`TimeLens-Bench/` 和 `video_shards/` 都不要）：
 
 ```bash
-(cd ../Lkmllm_data/datasets/Test && \
-  mkdir -p Activitynet/activitynet Charades_sta/charades Qvhighlights/qvhighlights && \
-  find TimeLens-Bench/video_shards/activitynet  -name "*.tar.gz" -exec tar -xzf {} -C Activitynet/activitynet  \; && \
-  find TimeLens-Bench/video_shards/charades     -name "*.tar.gz" -exec tar -xzf {} -C Charades_sta/charades     \; && \
-  find TimeLens-Bench/video_shards/qvhighlights -name "*.tar.gz" -exec tar -xzf {} -C Qvhighlights/qvhighlights \; && \
-  mv TimeLens-Bench/activitynet-timelens.json  Activitynet/ && \
-  mv TimeLens-Bench/charades-timelens.json     Charades_sta/ && \
-  mv TimeLens-Bench/qvhighlights-timelens.json Qvhighlights/ && \
-  rm -rf TimeLens-Bench)
+cd ../Lkmllm_data/datasets/Test
+
+# 创建目标目录
+mkdir -p Activitynet/activitynet Charades_sta/charades Qvhighlights/qvhighlights
+
+# 解压视频分片（每个数据集有多个 *_shard_*.tar.gz）
+# --strip-components=1 去掉 tar 内可能嵌套的一层同名目录
+find TimeLens-Bench/video_shards/activitynet  -name "*.tar.gz" -exec tar -xzf {} --strip-components=1 -C Activitynet/activitynet  \;
+find TimeLens-Bench/video_shards/charades     -name "*.tar.gz" -exec tar -xzf {} --strip-components=1 -C Charades_sta/charades     \;
+find TimeLens-Bench/video_shards/qvhighlights -name "*.tar.gz" -exec tar -xzf {} --strip-components=1 -C Qvhighlights/qvhighlights \;
+
+# 移动标注文件
+mv TimeLens-Bench/activitynet-timelens.json  Activitynet/
+mv TimeLens-Bench/charades-timelens.json     Charades_sta/
+mv TimeLens-Bench/qvhighlights-timelens.json Qvhighlights/
+
+# 清理
+rm -rf TimeLens-Bench
 ```
 
 > 解压后如果某个 `.tar.gz` 里还套了一层同名目录（如变成 `Activitynet/activitynet/activitynet/xxx.mp4`），给上面的 `tar -xzf {}` 加 `--strip-components=1` 再跑一次。若你的下载里 `video_shards/` 是平铺的 `*.tar.gz`（没有三个子目录），把三个 `find TimeLens-Bench/video_shards/activitynet ...` 路径改成 `find TimeLens-Bench/video_shards -path "*activitynet*" -name "*.tar.gz" ...`（charades / qvhighlights 同理）。
