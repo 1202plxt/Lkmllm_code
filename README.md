@@ -172,12 +172,35 @@ torchrun --nproc_per_node=${NUM_GPUS} \
 
 ## 评测
 
-暂无独立 eval 脚本。时序定位指标（MAE / IoU）的辅助函数在 `scripts/c_time_utils.py`：
+评测脚本 `scripts/e_head_eval.py`（纯 generate 路径，多卡数据并行）。**采样/编码参数必须和训练完全一致**，否则 IoU 会掉到接近随机：默认已对齐训练（`--fps 2 --max-frames 200 --min-tokens 16 --total-tokens 3584 --attn-implementation flash_attention_2`），无需显式传；若训练时改过这些值，评测也要传同样的值。
 
-- `generate_prediction(model, processor, inputs)`：生成并解析起止时间
-- `compute_mae(pred, gt)` / `compute_iou(pred, gt)`：计算指标
+```bash
+# top-K HeadLoRA（微调后主实验）
+python scripts/e_head_eval.py \
+  --model-path ../Lkmllm_data/checkpoints/lora_layer \
+  --anno-json  ../Lkmllm_data/datasets/Test/Charades_sta/charades-timelens.json \
+  --video-dir  ../Lkmllm_data/datasets/Test/Charades_sta/charades \
+  --output-dir ../Lkmllm_data/outputs/eval_results \
+  --split charades_topk
 
-如需评测，基于这几个函数补一个 eval 脚本即可（TODO）。
+# base baseline（对照，采样参数用同一套默认值）
+python scripts/e_head_eval.py \
+  --model-path ../shared_models/Qwen3-VL-8B-Instruct \
+  --anno-json  ../Lkmllm_data/datasets/Test/Charades_sta/charades-timelens.json \
+  --video-dir  ../Lkmllm_data/datasets/Test/Charades_sta/charades \
+  --output-dir ../Lkmllm_data/outputs/eval_results \
+  --split charades_base
+```
+
+多卡：脚本默认 `--num-gpus 0`（自动检测所有 GPU，数据并行——每卡加载完整模型、样本均分、主进程合并）。要限制卡数用 `--num-gpus N`；显存不足时调低 `--max-frames`（长视频）或 `--total-tokens`（但需与训练保持一致才有可比性）。
+
+评测其它数据集时，换 `--anno-json` / `--video-dir` / `--split`：
+
+- Charades-STA：`../Lkmllm_data/datasets/Test/Charades_sta/charades-timelens.json` + `.../Charades_sta/charades`
+- ActivityNet：`../Lkmllm_data/datasets/Test/Activitynet/activitynet-timelens.json` + `.../Activitynet/activitynet`
+- QVHighlights：`../Lkmllm_data/datasets/Test/Qvhighlights/qvhighlights-timelens.json` + `.../Qvhighlights/qvhighlights`
+
+输出（在 `--output-dir` 下）：`metrics_<split>.json`（`mIoU` + `R@1_IoU0.3/0.5/0.7`）、`details_<split>.jsonl`（逐条预测）、`failures_<split>.jsonl`（零 IoU 的 badcase）。
 
 ## 输出说明
 
