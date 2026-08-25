@@ -19,13 +19,13 @@ m_e_head_eval.py — TimeLens Temporal Grounding 多卡评测
 
 八卡评测微调模型：
 
-  CUDA_VISIBLE_DEVICES=0,1,2,3,4,5,6,7 python scripts/m_e_head_eval.py \
+  CUDA_VISIBLE_DEVICES=0,1,2,3,4,5,6,7 python scripts/e_head_eval.py \
     --model-path ../Lkmllm_data/checkpoints/layer12_19_qvo_lora_r8_align001_mGPU \
     --anno-json ../Lkmllm_data/datasets/Test/Charades_sta/charades-timelens.json \
     --video-dir ../Lkmllm_data/datasets/Test/Charades_sta/charades \
     --output-dir ../Lkmllm_data/outputs/eval_results \
     --split Charades_layer12_19_qvo_r8_align001_mGPU \
-    --num-gpus 8
+    --num-gpus 1
 
 八卡评测 Qwen3-VL-8B base：
 
@@ -76,7 +76,8 @@ if str(REPO_ROOT) not in sys.path:
 from src.project_paths import A_DATA_ROOT, ensure_directory, resolve_path, SHARED_MODELS_ROOT
 
 # processor 内部按 patch 换算 pixel 预算：每个 patch 是 28*28 像素
-PATCH_PIXELS = 28 * 28
+# Qwen3-VL: 16x16 vision patch followed by a 2x2 spatial merge.
+PATCH_PIXELS = 32 * 32
 
 
 # ═══════════════════════════════════════════════════════════════════════════════════
@@ -331,7 +332,10 @@ def build_inputs_timelens(processor, frames: list, query: str, device,
         messages, tokenize=False, add_generation_prompt=True,
     )
     image_inputs, video_inputs, video_kwargs = process_vision_info(
-        messages, return_video_kwargs=True, return_video_metadata=True,
+        messages,
+        image_patch_size=16,
+        return_video_kwargs=True,
+        return_video_metadata=True,
     )
     if video_inputs:
         video_tensors, video_metadatas = zip(*video_inputs)
