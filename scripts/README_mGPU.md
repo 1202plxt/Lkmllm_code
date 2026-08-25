@@ -79,7 +79,7 @@ torchrun --standalone --nproc_per_node 8 \
     --max-frames 448 \
     --min-tokens 64 \
     --total-tokens 14336 \
-    --layers-per-batch 2
+    --layers-per-batch 4
 ```
 
 这里的 `--max-samples 500` 是八卡合计 500 条，不是每卡 500 条。`--max-duration 0` 表示不按视频时长筛选，使候选集合与微调数据分布一致。视频输入参数与当前微调/评测保持一致：2 FPS、不额外限制帧数、`min_tokens=64`、`total_tokens=14336`。
