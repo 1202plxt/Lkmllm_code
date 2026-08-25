@@ -249,7 +249,8 @@ CUDA_VISIBLE_DEVICES=0,1,2,3,4,5,6,7 python scripts/m_e_head_eval.py \
 | QVHighlights-TimeLens | 74.2 | 64.6 | 49.3 | 59.4 |
 
 ### 500样本base模型和topk对比结果
-|	R@0.3|	R@0.5|	R@0.7|	mIoU|
+| 测试集 | R@0.3 | R@0.5 | R@0.7 | mIoU |
+|---|---:|---:|---:|---:|
 |Qvhighlights_base|	0.5640|	0.4680|	0.3720|	0.4437|
 |Qvhighlights_topk|	0.6500|	0.5540|	0.4380|	0.5366|
 |Charades_base|	0.6340|	0.4780|	0.2560	|0.4438|
