@@ -235,6 +235,60 @@ CUDA_VISIBLE_DEVICES=0,1,2,3,4,5,6,7 python scripts/m_e_head_eval.py \
   --num-gpus 8
 ```
 
+### TimeLens-8B：三个 TimeLens 数据集
+
+TimeLens-8B 模型路径：
+
+```text
+../shared_models/TimeLens-8B
+```
+
+以下三条命令必须传入 `--timelens-model`。该开关会启用 TimeLens-8B 的官方
+prompt、processor 设置和 greedy generation；多卡评测的输入参数仍统一使用本
+README 第 1 节所列的 TimeLens 全量协议：`fps=2`、`max_frames=0`、
+`min_tokens=64`、`total_tokens=14336`、`32×32` pixel budget、
+`image_patch_size=16`。`m_e_head_eval.py` 自己创建 8 个 GPU worker，不要使用
+`torchrun` 外套启动。
+
+#### TimeLens-8B：Charades-STA
+
+```bash
+CUDA_VISIBLE_DEVICES=0,1,2,3,4,5,6,7 python scripts/m_e_head_eval.py \
+  --model-path ../shared_models/TimeLens-8B \
+  --anno-json ../Lkmllm_data/datasets/Test/Charades_sta/charades-timelens.json \
+  --video-dir ../Lkmllm_data/datasets/Test/Charades_sta/charades \
+  --output-dir ../Lkmllm_data/outputs/eval_results \
+  --split Charades_TimeLens8B_mGPU \
+  --timelens-model \
+  --num-gpus 8
+```
+
+#### TimeLens-8B：ActivityNet
+
+```bash
+CUDA_VISIBLE_DEVICES=0,1,2,3,4,5,6,7 python scripts/m_e_head_eval.py \
+  --model-path ../shared_models/TimeLens-8B \
+  --anno-json ../Lkmllm_data/datasets/Test/Activitynet/activitynet-timelens.json \
+  --video-dir ../Lkmllm_data/datasets/Test/Activitynet/activitynet \
+  --output-dir ../Lkmllm_data/outputs/eval_results \
+  --split ActivityNet_TimeLens8B_mGPU \
+  --timelens-model \
+  --num-gpus 8
+```
+
+#### TimeLens-8B：QVHighlights
+
+```bash
+CUDA_VISIBLE_DEVICES=0,1,2,3,4,5,6,7 python scripts/m_e_head_eval.py \
+  --model-path ../shared_models/TimeLens-8B \
+  --anno-json ../Lkmllm_data/datasets/Test/Qvhighlights/qvhighlights-timelens.json \
+  --video-dir ../Lkmllm_data/datasets/Test/Qvhighlights/qvhighlights \
+  --output-dir ../Lkmllm_data/outputs/eval_results \
+  --split QVHighlights_TimeLens8B_mGPU \
+  --timelens-model \
+  --num-gpus 8
+```
+
 
 ## 6. TimeLens 官方实验结果
 
