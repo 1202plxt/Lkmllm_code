@@ -98,6 +98,12 @@ TIMELENS_USER_TEMPLATE = (
     "'The event happens in <start time> - <end time> seconds'."
 )
 
+TIMELENS8_OFFICIAL_PROMPT = (
+    "Please find the visual event described by the sentence '{}', determining its "
+    "starting and ending times. The format should be: 'The event happens in "
+    "<start time> - <end time> seconds'."
+)
+
 
 # ═══════════════════════════════════════════════════════════════════════════════════
 # CLI
@@ -128,9 +134,15 @@ def build_parser() -> argparse.ArgumentParser:
     p.add_argument("--max-size",    type=int, default=256,
                    help="仅当 --total-tokens<=0 时才用；训练默认走 total-tokens 路径，"
                         "这个值就用不上")
-    p.add_argument("--max-new-tokens", type=int, default=64)
+    p.add_argument("--max-new-tokens", type=int, default=512,
+                   help="TimeLens 全量评测默认生成上限 512")
     p.add_argument("--temperature", type=float, default=0.0,
                    help="0 表示 greedy decoding (确定性、可复现)；> 0 会走采样")
+    p.add_argument(
+        "--timelens-model", action="store_true",
+        help="评测官方 TimeLens-8B：只切换官方 prompt/processor 和 greedy "
+             "generation；输入预算与多卡 base/LoRA 一样使用 TimeLens 全量参数",
+    )
 
     # Token 预算 (和训练一致，是决定 IoU 的关键路径)
     p.add_argument("--min-tokens",   type=int, default=64,
@@ -205,13 +217,15 @@ def sample_frames(video_path: Path, fps: float) -> list:
 
 def load_model_and_processor(model_dir: Path, gpu_mem_gib: float = 16.0,
                                cpu_mem_gib: float = 64.0,
-                               attn_implementation: str = "flash_attention_2"):
+                               attn_implementation: str = "flash_attention_2",
+                               timelens_model: bool = False):
     """加载模型 (base 或 HeadLoRA 合并后的 checkpoint)，多卡均衡分配。"""
     from transformers import AutoModelForImageTextToText, AutoProcessor
 
-    processor = AutoProcessor.from_pretrained(
-        str(model_dir), trust_remote_code=True, local_files_only=True,
-    )
+    processor_kwargs = dict(trust_remote_code=True, local_files_only=True)
+    if timelens_model:
+        processor_kwargs.update(padding_side="left", do_resize=False)
+    processor = AutoProcessor.from_pretrained(str(model_dir), **processor_kwargs)
     # ⚠️ 上一版这里硬编码 shortest_edge=128，会把视频细节压得远低于训练时；
     # 训练时 collate_fn_with_processor 里没有做这一步 —— 保持 processor 默认。
 
@@ -258,14 +272,16 @@ def load_model_and_processor(model_dir: Path, gpu_mem_gib: float = 16.0,
 
 
 def load_model_and_processor_single_gpu(model_dir: Path, gpu_id: int,
-                                        attn_implementation: str = "flash_attention_2"):
+                                        attn_implementation: str = "flash_attention_2",
+                                        timelens_model: bool = False):
     """在指定单张 GPU 上加载完整模型（多卡数据并行时每个进程调用一次）。
     不用 device_map='auto' 的跨卡分片，而是整个模型放到一张卡上。"""
     from transformers import AutoModelForImageTextToText, AutoProcessor
 
-    processor = AutoProcessor.from_pretrained(
-        str(model_dir), trust_remote_code=True, local_files_only=True,
-    )
+    processor_kwargs = dict(trust_remote_code=True, local_files_only=True)
+    if timelens_model:
+        processor_kwargs.update(padding_side="left", do_resize=False)
+    processor = AutoProcessor.from_pretrained(str(model_dir), **processor_kwargs)
     # 不手动改 processor.video_processor.size（和训练 collate 保持一致）
 
     if attn_implementation == "flash_attention_2":
@@ -302,7 +318,8 @@ def load_model_and_processor_single_gpu(model_dir: Path, gpu_id: int,
 
 def build_inputs_timelens(processor, frames: list, query: str, device,
                           sample_fps: float,
-                          min_tokens: int, total_tokens: int
+                          min_tokens: int, total_tokens: int,
+                          timelens_model: bool = False,
                           ) -> Optional[dict]:
     """构建 TimeLens 格式的模型输入 (只用于 generate)，frames 为空返回 None。"""
     from qwen_vl_utils import process_vision_info
@@ -310,7 +327,8 @@ def build_inputs_timelens(processor, frames: list, query: str, device,
     if not frames:
         return None
 
-    user_text = TIMELENS_USER_TEMPLATE.format(query=query)
+    user_text = (TIMELENS8_OFFICIAL_PROMPT.format(query)
+                 if timelens_model else TIMELENS_USER_TEMPLATE.format(query=query))
 
     # 和训练时 collate_fn_with_processor 里的 video_content 走同一条路径
     video_content = {"type": "video", "video": frames, "sample_fps": sample_fps}
@@ -318,15 +336,21 @@ def build_inputs_timelens(processor, frames: list, query: str, device,
         video_content["min_pixels"]   = min_tokens * PATCH_PIXELS
         video_content["total_pixels"] = total_tokens * PATCH_PIXELS
 
-    messages = [
-        {"role": "system", "content": [
-            {"type": "text", "text": TIMELENS_SYSTEM}
-        ]},
-        {"role": "user", "content": [
+    if timelens_model:
+        messages = [{"role": "user", "content": [
             video_content,
             {"type": "text", "text": user_text},
-        ]},
-    ]
+        ]}]
+    else:
+        messages = [
+            {"role": "system", "content": [
+                {"type": "text", "text": TIMELENS_SYSTEM}
+            ]},
+            {"role": "user", "content": [
+                video_content,
+                {"type": "text", "text": user_text},
+            ]},
+        ]
 
     text_input = processor.apply_chat_template(
         messages, tokenize=False, add_generation_prompt=True,
@@ -438,7 +462,8 @@ def temporal_iou(ps: float, pe: float, gs: float, ge: float) -> float:
 def infer_generate(model, processor, frames: list, query: str, device,
                    duration: float, sample_fps: float,
                    min_tokens: int, total_tokens: int,
-                   max_new_tokens: int = 64, temperature: float = 0.0
+                   max_new_tokens: int = 64, temperature: float = 0.0,
+                   timelens_model: bool = False,
                    ) -> Tuple[Tuple[float, float], str]:
     """
     让模型生成 TimeLens 格式的答案，解析时间戳。
@@ -448,12 +473,17 @@ def infer_generate(model, processor, frames: list, query: str, device,
         processor, frames, query, device,
         sample_fps=sample_fps,
         min_tokens=min_tokens, total_tokens=total_tokens,
+        timelens_model=timelens_model,
     )
     if inputs is None:
         return (0.0, 0.0), ""
 
-    gkw = dict(max_new_tokens=max_new_tokens, do_sample=temperature > 0)
-    if temperature > 0:
+    if timelens_model:
+        gkw = dict(max_new_tokens=max_new_tokens, do_sample=False,
+                   temperature=None, top_p=None, top_k=None)
+    else:
+        gkw = dict(max_new_tokens=max_new_tokens, do_sample=temperature > 0)
+    if temperature > 0 and not timelens_model:
         gkw["temperature"] = temperature
 
     gen_ids = model.generate(
@@ -553,16 +583,52 @@ class Metrics:
 # 样本加载 (兼容多种数据集格式，跟微调路径无关，原样保留)
 # ═══════════════════════════════════════════════════════════════════════════════════
 
+_VIDEO_EXTENSIONS = {".mp4", ".mkv", ".avi", ".webm"}
+_VIDEO_INDEX_CACHE: dict[str, dict[str, Path]] = {}
+
+
+def _video_index(video_dir: Path) -> dict[str, Path]:
+    """Create one recursive basename index for datasets with nested video dirs."""
+    key = str(video_dir.resolve())
+    if key not in _VIDEO_INDEX_CACHE:
+        index: dict[str, Path] = {}
+        for path in sorted(video_dir.rglob("*")):
+            if path.is_file() and path.suffix.lower() in _VIDEO_EXTENSIONS:
+                index.setdefault(path.name.casefold(), path)
+        _VIDEO_INDEX_CACHE[key] = index
+        print(f"  视频索引: {len(index)} 个文件（递归扫描 {video_dir}）")
+    return _VIDEO_INDEX_CACHE[key]
+
+
 def resolve_video_path(video_dir: Path, s: dict) -> Optional[Path]:
-    for ext in [".mp4", ".mkv", ".avi", ".webm"]:
-        vpath = video_dir / f"{s['video_id']}{ext}"
-        if vpath.exists():
-            return vpath
-    rel = s.get("video_rel_path", "")
+    video_id = str(s["video_id"])
+    rel = str(s.get("video_rel_path", "") or "")
+    candidates = []
     if rel:
-        vpath = video_dir / rel
-        if vpath.exists():
-            return vpath
+        candidates.append(video_dir / rel)
+    for ext in _VIDEO_EXTENSIONS:
+        filename = f"{video_id}{ext}"
+        candidates.extend([
+            video_dir / filename,
+            video_dir / "videos" / filename,
+            video_dir / "video" / filename,
+            video_dir / "qvhighlights" / filename,
+        ])
+    for path in candidates:
+        if path.is_file():
+            return path
+
+    # Keep the complete clip id; stripping _start_end would load a different
+    # temporal coordinate system and make the local GT timestamps invalid.
+    index = _video_index(video_dir)
+    if rel:
+        found = index.get(Path(rel).name.casefold())
+        if found is not None:
+            return found
+    for ext in _VIDEO_EXTENSIONS:
+        found = index.get(f"{video_id}{ext}".casefold())
+        if found is not None:
+            return found
     return None
 
 
@@ -794,6 +860,7 @@ def evaluate_dataset(model, processor, dataset, device, args, gpu_id=None):
                 min_tokens=args.min_tokens, total_tokens=args.total_tokens,
                 max_new_tokens=args.max_new_tokens,
                 temperature=args.temperature,
+                timelens_model=args.timelens_model,
             )
             parse_ok = not (pred_raw.strip() and ps == 0.0 and pe == 0.0)
 
@@ -809,6 +876,9 @@ def evaluate_dataset(model, processor, dataset, device, args, gpu_id=None):
             })
             continue
         except Exception as ex:
+            if sum(1 for r in records if str(r.get("status", "")).startswith("error:")) < 5:
+                pbar.write(f"[ERROR] idx={idx} video={item['video_id']} "
+                           f"{type(ex).__name__}: {ex}")
             records.append({
                 "video_id": item["video_id"], "query": item["query"],
                 "gt_start": gs, "gt_end": ge,
@@ -863,7 +933,8 @@ def _worker_entry(gpu_id: int, model_dir: Path, samples: list, video_dir: Path,
 
     print(f"\n[GPU{gpu_id}] 加载模型: {model_dir}")
     model, processor, _ = load_model_and_processor_single_gpu(
-        model_dir, gpu_id, attn_implementation=args.attn_implementation)
+        model_dir, gpu_id, attn_implementation=args.attn_implementation,
+        timelens_model=args.timelens_model)
     device = torch.device(f"cuda:{gpu_id}")
 
     dataset = EvalDataset(samples, video_dir, args.fps,
@@ -882,6 +953,8 @@ def _worker_entry(gpu_id: int, model_dir: Path, samples: list, video_dir: Path,
 
 def main(argv=None):
     args = build_parser().parse_args(argv)
+    # All model types share the TimeLens full-evaluation defaults in this
+    # multi-GPU entry. The flag changes prompt/processor/generation only.
     out_dir = ensure_directory(Path(args.output_dir))
 
     # ── 环境 ──
@@ -895,7 +968,8 @@ def main(argv=None):
         print(f"    GPU{gi}: {torch.cuda.get_device_name(gi)}")
 
     # ── 打印对齐配置 ──
-    print("\n[对齐训练的采样/编码参数]")
+    mode_name = "TimeLens-8B 官方评测模式" if args.timelens_model else "base/LoRA 对齐模式"
+    print(f"\n[{mode_name}]")
     print(f"  fps            = {args.fps}   (TimeLens 官方默认 2.0)")
     print(f"  max_frames     = {args.max_frames}   (TimeLens 官方默认 0=不额外截帧)")
     print(f"  min_tokens     = {args.min_tokens}   (TimeLens 官方默认 64)")
@@ -933,7 +1007,8 @@ def main(argv=None):
         print(f"  模式: generate (单卡 GPU 0)")
         print(f"{'─'*64}")
         model, processor, _ = load_model_and_processor_single_gpu(
-            model_dir, 0, attn_implementation=args.attn_implementation)
+            model_dir, 0, attn_implementation=args.attn_implementation,
+            timelens_model=args.timelens_model)
         device = torch.device("cuda:0")
         dataset = EvalDataset(samples, video_dir, args.fps,
                               args.max_frames, args.max_size,
