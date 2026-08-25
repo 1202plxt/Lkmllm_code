@@ -7,7 +7,8 @@ m_d_startend_gradient_head_attribution.py
 score matrix，重新计算 Top-K，并生成与单卡脚本同名的最终 JSON/热力图。
 
 默认探测 500 条样本，并与当前 TimeLens 微调/评测输入保持一致：
-  fps=2.0, max_frames=0（不截帧）, min_tokens=64, total_tokens=14336。
+  fps=2.0, min_tokens=64, total_tokens=14336；max_frames=0 时自动按
+  2*total_tokens/min_tokens 推导帧数上限，即最多均匀采样 448 帧。
 视觉预算按 Qwen3-VL 的 16x16 patch、2x2 spatial merge 计算，即每个合并后
 visual token 对应 32x32 输入像素。共享归因后端也使用相同配置。
 注意：归因必须取得 attention weights，因此 attention backend 仍为 eager，不能使用
@@ -15,16 +16,17 @@ visual token 对应 32x32 输入像素。共享归因后端也使用相同配置
 
 八卡运行：
 
-  torchrun --standalone --nproc_per_node 8 \
+  torchrun --standalone --nproc_per_node 1 \
     scripts/m_d_startend_gradient_head_attribution.py \
     --filtered-json ../Lkmllm_data/datasets/Train/timelens-100k/timelens-100k.jsonl \
     --model-path ../shared_models/Qwen3-VL-8B-Instruct \
     --video-dir ../Lkmllm_data/datasets/Train/timelens-100k \
     --output-dir ../Lkmllm_data/outputs/startend_gradient_head_attr_mGPU \
     --max-samples 500 \
-    --max-duration 0 \
+    --max-duration 30 \
     --top-k 30 \
     --fps 2 \
+    --max-frames 448 \
     --min-tokens 64 \
     --total-tokens 14336 \
     --layers-per-batch 2
