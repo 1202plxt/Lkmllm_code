@@ -915,7 +915,9 @@ def collate_fn_with_processor(batch, processor, device):
     item = batch[0]
     if not item["frames"]:
         return None
-    PATCH_PIXELS = 28 * 28
+    # Qwen3-VL uses a 16x16 vision patch and a 2x2 spatial merge, so one
+    # merged visual token corresponds to 32x32 input pixels.
+    PATCH_PIXELS = 32 * 32
     video_content = {"type": "video", "video": item["frames"],
                      "sample_fps": item["fps"]}
     if item.get("total_tokens", 0) > 0:
@@ -935,7 +937,11 @@ def collate_fn_with_processor(batch, processor, device):
     ]
     full_text = processor.apply_chat_template(messages, tokenize=False)
     imgs, vids, vkw = process_vision_info(
-        messages, return_video_kwargs=True, return_video_metadata=True)
+        messages,
+        image_patch_size=16,
+        return_video_kwargs=True,
+        return_video_metadata=True,
+    )
     if vids:
         vtens, vmetas = zip(*vids)
         vtens, vmetas = list(vtens), list(vmetas)
