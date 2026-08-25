@@ -240,13 +240,23 @@ CUDA_VISIBLE_DEVICES=0,1,2,3,4,5,6,7 python scripts/m_e_head_eval.py \
 
 下面是 [TimeLens 官方项目](https://github.com/pkuhxy/Timelens) 和 [TimeLens-8B 模型说明](https://huggingface.co/TencentARC/TimeLens-8B) 报告的 temporal grounding 结果。所有 R 指标均为 R@1，表中数值以百分数表示；脚本打印的 `0.512` 对应表中的 `51.2`。
 
-### Qwen3-VL-8B-Instruct base
+### Qwen3-VL-8B-Instruct base /topk
 
 | 测试集 | R@0.3 | R@0.5 | R@0.7 | mIoU |
 |---|---:|---:|---:|---:|
 | ActivityNet-TimeLens | 62.1 | 51.2 | 34.4 | 46.8 |
 | Charades-TimeLens | 69.2 | 53.4 | 27.5 | 48.3 |
 | QVHighlights-TimeLens | 74.2 | 64.6 | 49.3 | 59.4 |
+
+### 500样本base模型和topk对比结果
+|	R@0.3|	R@0.5|	R@0.7|	mIoU|
+|Qvhighlights_base|	0.5640|	0.4680|	0.3720|	0.4437|
+|Qvhighlights_topk|	0.6500|	0.5540|	0.4380|	0.5366|
+|Charades_base|	0.6340|	0.4780|	0.2560	|0.4438|
+|Charades_topk|	0.6960|	0.5600|	0.2960|	0.4956|
+|Activitynet_base|	0.458|	0.364|	0.244|	0.3546|
+|Activitynet_topk	|0.536|	0.458|	0.336|	0.4294|
+
 
 ### TimeLens-8B
 
