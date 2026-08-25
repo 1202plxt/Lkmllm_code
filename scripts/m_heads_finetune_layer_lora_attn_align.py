@@ -1375,7 +1375,10 @@ def main(argv=None):
         n_layers, n_heads, distributed, world_size)
 
     if is_main_process():
-        Path(args.output_dir, "config.json").write_text(json.dumps({
+        # Do not overwrite the Hugging Face config.json written by
+        # model.save_pretrained().  AutoConfig requires that file to contain
+        # fields such as ``model_type`` in order to reload the merged model.
+        Path(args.output_dir, "training_metadata.json").write_text(json.dumps({
         "architecture": "head_masked_lora_v1",
         "distributed": distributed,
         "world_size": world_size,
