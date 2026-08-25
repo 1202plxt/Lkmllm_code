@@ -1,4 +1,4 @@
-# VTG任务 多卡微调与评测
+# TimeLens 多卡微调与评测
 
 本文档对应以下两个脚本：
 
@@ -53,13 +53,58 @@
 
 训练启动后，rank 0 会打印完整参数配置、实际目标层、目标 head、alignment head、world size 和有效全局 batch size。
 
-## 2. 八卡微调
+## 2. 八卡 Head 探测
+
+对应脚本：
+
+```text
+scripts/m_d_startend_gradient_head_attribution.py
+```
+
+Head 探测用于确定值得进行 LoRA 或 attention alignment 的关键 head，不需要遍历全部 TimeLens-100K。推荐固定探测 500 条训练样本：规模已经足够用于估计稳定的 head 排名，同时不会让需要反向传播注意力权重的归因过程耗时过长。
+
+八卡模式由 `torchrun` 启动 8 个 rank。每个 rank 在自己的 GPU 上加载一份完整 base model，并处理同一个 500 条候选集合的 `rank::8` 切片，因此每卡约处理 62–63 条；完成后 rank 0 按各卡实际有效样本数加权合并矩阵并重新计算 Top-K。
+
+```bash
+torchrun --standalone --nproc_per_node 8 scripts/m_d_startend_gradient_head_attribution.py \
+  --filtered-json ../Lkmllm_data/datasets/Train/timelens-100k/timelens-100k.jsonl \
+  --model-path ../shared_models/Qwen3-VL-8B-Instruct \
+  --video-dir ../Lkmllm_data/datasets/Train/timelens-100k \
+  --output-dir ../Lkmllm_data/outputs/startend_gradient_head_attr_mGPU \
+  --max-samples 500 \
+  --max-duration 0 \
+  --top-k 30 \
+  --fps 2 \
+  --min-tokens 64 \
+  --total-tokens 14336 \
+  --layers-per-batch 2
+```
+
+这里的 `--max-samples 500` 是八卡合计 500 条，不是每卡 500 条。`--max-duration 0` 表示不按视频时长筛选，使候选集合与微调数据分布一致。视频输入参数与当前微调/评测保持一致：2 FPS、不额外限制帧数、`min_tokens=64`、`total_tokens=14336`。
+
+归因算法需要读取 attention weights，所以探测必须使用 `eager` attention，不能使用微调时的 `flash_attention_2`。这是算法实现上的必要差异；FPS、采帧和视觉 token budget 仍然保持一致。由于 eager attention 和反向传播比普通评测更占显存，24 GB GPU 若出现 OOM，先把 `--layers-per-batch` 从 2 降为 1；如果仍然 OOM，只能降低 `--total-tokens`，但此时需要在结果元数据中注明探测输入预算与微调不同。
+
+最终供微调脚本 `--attr-json` 使用的文件为：
+
+```text
+../Lkmllm_data/outputs/startend_gradient_head_attr_mGPU/startend_gradient_head_attribution.json
+```
+
+各 rank 的中间结果保存在：
+
+```text
+../Lkmllm_data/outputs/startend_gradient_head_attr_mGPU/_rank_outputs/rank_<N>/
+```
+
+最终 JSON 已经是八卡加权合并结果，不要把单个 rank 的 JSON 传给微调脚本。
+
+## 3. 八卡微调
 
 以下命令使用 8 张 GPU，并直接通过 `torchrun` 启动。反斜杠 `\` 必须是每行最后一个字符，后面不能有空格。
 
 ```bash
 torchrun --standalone --nproc_per_node 8 scripts/m_heads_finetune_layer_lora_attn_align.py \
-  --attr-json ../Lkmllm_data/outputs/startend_gradient_head_attr/startend_gradient_head_attribution.json \
+  --attr-json ../Lkmllm_data/outputs/startend_gradient_head_attr_mGPU/startend_gradient_head_attribution.json \
   --model-path ../shared_models/Qwen3-VL-8B-Instruct \
   --anno-json ../Lkmllm_data/datasets/Train/timelens-100k/timelens-100k.jsonl \
   --video-dir ../Lkmllm_data/datasets/Train/timelens-100k \
@@ -80,7 +125,7 @@ torchrun --standalone --nproc_per_node 8 scripts/m_heads_finetune_layer_lora_att
 
 ```bash
 CUDA_VISIBLE_DEVICES=0,1,2,3,4,5,6,7 torchrun --standalone --nproc_per_node 8 scripts/m_heads_finetune_layer_lora_attn_align.py \
-  --attr-json ../Lkmllm_data/outputs/startend_gradient_head_attr/startend_gradient_head_attribution.json \
+  --attr-json ../Lkmllm_data/outputs/startend_gradient_head_attr_mGPU/startend_gradient_head_attribution.json \
   --model-path ../shared_models/Qwen3-VL-8B-Instruct \
   --anno-json ../Lkmllm_data/datasets/Train/timelens-100k/timelens-100k.jsonl \
   --video-dir ../Lkmllm_data/datasets/Train/timelens-100k \
@@ -91,7 +136,7 @@ CUDA_VISIBLE_DEVICES=0,1,2,3,4,5,6,7 torchrun --standalone --nproc_per_node 8 sc
   --lr 3e-5
 ```
 
-## 3. 保存内容与断点恢复
+## 4. 保存内容与断点恢复
 
 训练过程中，主进程在输出目录中维护：
 
@@ -106,7 +151,7 @@ layer12_19_qvo_lora_r8_align001_mGPU/
 
 如果训练中断，使用完全相同的微调命令再次启动。脚本会从输出目录中的 `lora_layer_checkpoint.pt` 恢复。正常训练结束后，LoRA 会合并进基础模型并通过 `save_pretrained` 保存，所以评测时应直接把整个输出目录传给 `--model-path`，不需要手动加载 `lora_layer_adapter.pt`。
 
-## 4. 八卡评测已保存的微调模型
+## 5. 八卡评测已保存的微调模型
 
 以下命令直接评测上面保存的模型。`m_e_head_eval.py` 自己创建 8 个 GPU worker，因此评测入口使用 `python`，不要外套 `torchrun`。当前评测脚本若由 `torchrun --nproc_per_node 8` 启动，每个 rank 都会再次创建一整组 worker，导致重复推理和显存冲突。
 
@@ -148,7 +193,7 @@ failures_<split>.jsonl
 
 其中 metrics 保存 mIoU 与 R@1 IoU 0.3/0.5/0.7，details 保存逐样本预测，failures 保存失败或零 IoU 样本。
 
-## 5. 其他 TimeLens 测试集
+## 6. 其他 TimeLens 测试集
 
 ActivityNet-TimeLens 和 QVHighlights-TimeLens 使用同一条评测命令，只需要把以下三个参数换成对应的实际本地路径：
 
@@ -164,7 +209,7 @@ CUDA_VISIBLE_DEVICES=0,1,2,3,4,5,6,7 python scripts/m_e_head_eval.py \
 
 不要凭数据集名称猜目录；以服务器上的实际 annotation 和 video 路径为准。微调模型和 base 模型必须使用相同的 annotation、视频目录、FPS、token budget、解码设置和样本集合。
 
-## 6. TimeLens 官方实验结果
+## 7. TimeLens 官方实验结果
 
 下面是 [TimeLens 官方项目](https://github.com/pkuhxy/Timelens) 和 [TimeLens-8B 模型说明](https://huggingface.co/TencentARC/TimeLens-8B) 报告的 temporal grounding 结果。所有 R 指标均为 R@1，表中数值以百分数表示；脚本打印的 `0.512` 对应表中的 `51.2`。
 
@@ -188,7 +233,7 @@ CUDA_VISIBLE_DEVICES=0,1,2,3,4,5,6,7 python scripts/m_e_head_eval.py \
 
 
 
-## 7. 常见问题
+## 8. 常见问题
 
 ### 参数被识别为缺失
 
@@ -210,4 +255,3 @@ command \
 ### `use_cache=True` 与 gradient checkpointing 提示
 
 Transformers 会自动关闭训练时的 KV cache，以兼容 gradient checkpointing。这是正常提示，不是报错。
-
