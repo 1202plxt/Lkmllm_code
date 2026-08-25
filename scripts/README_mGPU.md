@@ -55,6 +55,8 @@
 
 ## 2. 八卡 Head 探测
 
+我已有初步探测head的json结果：startend_gradient_head_attribution.json，在当前目录下存放
+
 对应脚本：
 
 ```text
