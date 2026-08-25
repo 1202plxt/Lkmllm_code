@@ -8,6 +8,8 @@ score matrix，重新计算 Top-K，并生成与单卡脚本同名的最终 JSON
 
 默认探测 500 条样本，并与当前 TimeLens 微调/评测输入保持一致：
   fps=2.0, max_frames=0（不截帧）, min_tokens=64, total_tokens=14336。
+视觉预算按 Qwen3-VL 的 16x16 patch、2x2 spatial merge 计算，即每个合并后
+visual token 对应 32x32 输入像素。共享归因后端也使用相同配置。
 注意：归因必须取得 attention weights，因此 attention backend 仍为 eager，不能使用
 微调时的 flash_attention_2；这是归因算法要求，不是输入参数不一致。
 
