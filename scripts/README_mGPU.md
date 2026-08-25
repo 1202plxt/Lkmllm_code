@@ -31,8 +31,8 @@
 | learning rate | 5e-5 |
 | epochs | 3 |
 | gradient accumulation | 8 |
-| 每个数据子集最多采样 | 4000（这部分可以直接设置 |
-|  |
+| 每个数据子集最多采样 | 800 |
+| max samples | 4000（仅关闭分来源采样时生效） |
 
 ### 推荐的 8 卡正式实验规模
 
@@ -167,9 +167,17 @@ CUDA_VISIBLE_DEVICES=0,1,2,3,4,5,6,7 python scripts/m_e_head_eval.py \
   --num-gpus 8
 ```
 
-### Qwen3-VL-8B base 对照
+### Qwen3-VL-8B base：三个 TimeLens 数据集
 
-保持同一套评测参数，只替换 `--model-path` 和 `--split`：
+三个数据集都使用同一个 base 模型：
+
+```text
+../shared_models/Qwen3-VL-8B-Instruct
+```
+
+所有评测参数保持完全一致，仅更换 annotation、视频目录和 `--split`。下面的 ActivityNet/QVHighlights 路径采用 TimeLens-Bench 官方目录结构；Charades 使用当前项目中已经验证过的本地目录。
+
+#### Charades-TimeLens
 
 ```bash
 CUDA_VISIBLE_DEVICES=0,1,2,3,4,5,6,7 python scripts/m_e_head_eval.py \
@@ -181,35 +189,32 @@ CUDA_VISIBLE_DEVICES=0,1,2,3,4,5,6,7 python scripts/m_e_head_eval.py \
   --num-gpus 8
 ```
 
-`--num-gpus 0` 会自动使用所有可见 GPU；`--num-gpus 1` 可在单卡上运行。默认 `--max-samples 0` 表示评测完整测试集。若只做快速验证，可显式添加 `--max-samples 500`，但这种结果不能与完整测试集官方结果直接比较。
-
-评测输出包括：
-
-```text
-metrics_<split>.json
-details_<split>.jsonl
-failures_<split>.jsonl
-```
-
-其中 metrics 保存 mIoU 与 R@1 IoU 0.3/0.5/0.7，details 保存逐样本预测，failures 保存失败或零 IoU 样本。
-
-## 6. 其他 TimeLens 测试集
-
-ActivityNet-TimeLens 和 QVHighlights-TimeLens 使用同一条评测命令，只需要把以下三个参数换成对应的实际本地路径：
+#### ActivityNet-TimeLens
 
 ```bash
 CUDA_VISIBLE_DEVICES=0,1,2,3,4,5,6,7 python scripts/m_e_head_eval.py \
-  --model-path ../Lkmllm_data/checkpoints/layer12_19_qvo_lora_r8_align001_mGPU \
-  --anno-json /path/to/dataset-timelens.json \
-  --video-dir /path/to/videos \
+  --model-path ../shared_models/Qwen3-VL-8B-Instruct \
+  --anno-json ../Lkmllm_data/datasets/Test/Activitynet/activitynet-timelens.json \
+  --video-dir ../Lkmllm_data/datasets/Test/Activitynet/activitynet \
   --output-dir ../Lkmllm_data/outputs/eval_results \
-  --split Dataset_layer12_19_qvo_r8_align001_mGPU \
+  --split ActivityNet_Qwen3VL8B_base_mGPU \
   --num-gpus 8
 ```
 
-不要凭数据集名称猜目录；以服务器上的实际 annotation 和 video 路径为准。微调模型和 base 模型必须使用相同的 annotation、视频目录、FPS、token budget、解码设置和样本集合。
+#### QVHighlights-TimeLens
 
-## 7. TimeLens 官方实验结果
+```bash
+CUDA_VISIBLE_DEVICES=0,1,2,3,4,5,6,7 python scripts/m_e_head_eval.py \
+  --model-path ../shared_models/Qwen3-VL-8B-Instruct \
+  --anno-json ../Lkmllm_data/datasets/Test/Qvhighlights/qvhighlights-timelens.json \
+  --video-dir ../Lkmllm_data/datasets/Test/Qvhighlights/qvhighlights \
+  --output-dir ../Lkmllm_data/outputs/eval_results \
+  --split QVHighlights_Qwen3VL8B_base_mGPU \
+  --num-gpus 8
+```
+
+
+## 6. TimeLens 官方实验结果
 
 下面是 [TimeLens 官方项目](https://github.com/pkuhxy/Timelens) 和 [TimeLens-8B 模型说明](https://huggingface.co/TencentARC/TimeLens-8B) 报告的 temporal grounding 结果。所有 R 指标均为 R@1，表中数值以百分数表示；脚本打印的 `0.512` 对应表中的 `51.2`。
 
@@ -233,7 +238,7 @@ CUDA_VISIBLE_DEVICES=0,1,2,3,4,5,6,7 python scripts/m_e_head_eval.py \
 
 
 
-## 8. 常见问题
+## 7. 常见问题
 
 ### 参数被识别为缺失
 
