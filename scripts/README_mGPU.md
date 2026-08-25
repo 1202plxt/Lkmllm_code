@@ -166,7 +166,29 @@ CUDA_VISIBLE_DEVICES=0,1,2,3,4,5,6,7 python scripts/m_e_head_eval.py \
   --split Charades_layer12_19_qvo_r8_align001_mGPU \
   --num-gpus 8
 ```
+### ActivityNet-TimeLens
 
+```bash
+CUDA_VISIBLE_DEVICES=0,1,2,3,4,5,6,7 python scripts/m_e_head_eval.py \
+  --model-path ../Lkmllm_data/checkpoints/layer12_19_qvo_lora_r8_align001_mGPU \
+  --anno-json ../Lkmllm_data/datasets/Test/Activitynet/activitynet-timelens.json \
+  --video-dir ../Lkmllm_data/datasets/Test/Activitynet/activitynet \
+  --output-dir ../Lkmllm_data/outputs/eval_results \
+  --split ActivityNet_Qwen3VL8B_base_mGPU \
+  --num-gpus 8
+```
+
+#### QVHighlights-TimeLens
+
+```bash
+CUDA_VISIBLE_DEVICES=0,1,2,3,4,5,6,7 python scripts/m_e_head_eval.py \
+  --model-path ../Lkmllm_data/checkpoints/layer12_19_qvo_lora_r8_align001_mGPU \
+  --anno-json ../Lkmllm_data/datasets/Test/Qvhighlights/qvhighlights-timelens.json \
+  --video-dir ../Lkmllm_data/datasets/Test/Qvhighlights/qvhighlights \
+  --output-dir ../Lkmllm_data/outputs/eval_results \
+  --split QVHighlights_Qwen3VL8B_base_mGPU \
+  --num-gpus 8
+```
 ### Qwen3-VL-8B base：三个 TimeLens 数据集
 
 三个数据集都使用同一个 base 模型：
