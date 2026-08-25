@@ -66,18 +66,20 @@ Head 探测用于确定值得进行 LoRA 或 attention alignment 的关键 head�
 八卡模式由 `torchrun` 启动 8 个 rank。每个 rank 在自己的 GPU 上加载一份完整 base model，并处理同一个 500 条候选集合的 `rank::8` 切片，因此每卡约处理 62–63 条；完成后 rank 0 按各卡实际有效样本数加权合并矩阵并重新计算 Top-K。
 
 ```bash
-torchrun --standalone --nproc_per_node 8 scripts/m_d_startend_gradient_head_attribution.py \
-  --filtered-json ../Lkmllm_data/datasets/Train/timelens-100k/timelens-100k.jsonl \
-  --model-path ../shared_models/Qwen3-VL-8B-Instruct \
-  --video-dir ../Lkmllm_data/datasets/Train/timelens-100k \
-  --output-dir ../Lkmllm_data/outputs/startend_gradient_head_attr_mGPU \
-  --max-samples 500 \
-  --max-duration 0 \
-  --top-k 30 \
-  --fps 2 \
-  --min-tokens 64 \
-  --total-tokens 14336 \
-  --layers-per-batch 2
+torchrun --standalone --nproc_per_node 8 \
+    scripts/m_d_startend_gradient_head_attribution.py \
+    --filtered-json ../Lkmllm_data/datasets/Train/timelens-100k/timelens-100k.jsonl \
+    --model-path ../shared_models/Qwen3-VL-8B-Instruct \
+    --video-dir ../Lkmllm_data/datasets/Train/timelens-100k \
+    --output-dir ../Lkmllm_data/outputs/startend_gradient_head_attr_mGPU \
+    --max-samples 500 \
+    --max-duration 0 \
+    --top-k 30 \
+    --fps 2 \
+    --max-frames 448 \
+    --min-tokens 64 \
+    --total-tokens 14336 \
+    --layers-per-batch 2
 ```
 
 这里的 `--max-samples 500` 是八卡合计 500 条，不是每卡 500 条。`--max-duration 0` 表示不按视频时长筛选，使候选集合与微调数据分布一致。视频输入参数与当前微调/评测保持一致：2 FPS、不额外限制帧数、`min_tokens=64`、`total_tokens=14336`。
