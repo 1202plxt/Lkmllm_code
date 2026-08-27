@@ -301,8 +301,9 @@ CUDA_VISIBLE_DEVICES=0,1,2,3,4,5,6,7 python scripts/m_e_head_eval.py \
 | 测试集 | R@0.3 | R@0.5 | R@0.7 | mIoU |
 |---|---:|---:|---:|---:|
 | ActivityNet-TimeLens | 62.1 | 51.2 | 34.4 | 46.8 |
-| Charades-TimeLens | 69.2 | 53.4 | 27.5 | 48.3 |
-| QVHighlights-TimeLens | 74.2 | 64.6 | 49.3 | 59.4 |
+| Charades-TimeLens | 69.2 | 53.4 | 27.5 | 48.4 |
+|  Charades-TOPKLora | 74.7 | 59.3 | 31.0 | 51.9 |
+| QVHighlights-TimeLens | 69.4 | 60.35 | 46.9 | 57.6 |
 
 ### 500样本base模型和topk对比结果
 | 测试集 | R@0.3 | R@0.5 | R@0.7 | mIoU |
