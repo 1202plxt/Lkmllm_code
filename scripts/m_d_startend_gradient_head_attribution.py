@@ -1,33 +1,10 @@
-"""
-m_d_startend_gradient_head_attribution.py
-— 纯 GT attention head 的 torchrun 数据并行探测。
+"""Standalone TimeLens-8B GT-only head probing with torchrun data parallelism.
 
-每个 rank 在一张 GPU 上加载一份完整模型，并处理全局样本的
-rank::world_size 切片；该“一卡一模型、按 rank 分样本”结构保持不变。
-探测只使用 SDPA 时间戳 query 对视频内部 GT 区间的 attention 富集分数，
-不计算梯度归因、不 backward、不计算 combined。rank 0 按各 head 的有效
-样本数合并分数，最终只保留 video_only_head_attribution.json。
-
-输入默认 fps=2、min_tokens=64、total_tokens=14336，不设置额外帧数上限；
-token budget 交由 Qwen 视频处理器分配。
-
-八卡运行：
-
-  CUDA_VISIBLE_DEVICES=0 torchrun --standalone --nproc_per_node 1 scripts/m_d_startend_gradient_head_attribution.py \
-    --filtered-json ../Lkmllm_data/datasets/Train/timelens-100k/timelens-100k.jsonl \
-    --model-path ../shared_models/TimeLens-8B \
-    --timelens-model \
-    --video-dir ../Lkmllm_data/datasets/Train/timelens-100k \
-    --output-dir ../Lkmllm_data/outputs/m_timelens_head_attr_gt_only_500 \
-    --max-samples 2000 \
-    --max-duration 0 \
-    --top-k 30 \
-    --fps 2 \
-    --min-tokens 64 \
-    --total-tokens 14336
-
-最终结果：
-  <output-dir>/video_only_head_attribution.json
+GT scoring, timestamp handling and SDPA query-row capture are copied directly
+from new_d_head_attribution.py; there is no runtime dependency on that script.
+Each rank loads one complete model on its own GPU and processes rank::world_size.
+Default: TimeLens prompt/processor, 2 FPS, 14336 video tokens, no extra frame cap.
+Only video_only_head_attribution.json is retained after the weighted merge.
 """
 from __future__ import annotations
 
@@ -35,176 +12,161 @@ import argparse
 import gc
 import json
 import os
+import re
 import subprocess
 import sys
 import time
+from contextlib import nullcontext
 from pathlib import Path
 from typing import Dict, List, Optional, Tuple
 
-# 必须在 torch 初始化 CUDA 上下文之前设置，缓解显存碎片化导致的
-# "reserved but unallocated" OOM（PyTorch 官方建议）。
 os.environ.setdefault("PYTORCH_CUDA_ALLOC_CONF", "expandable_segments:True")
-
 import numpy as np
 
-REPO_ROOT = Path(__file__).resolve().parents[1]   # 项目根目录 = Lkmllm_code
+REPO_ROOT = Path(__file__).resolve().parents[1]
 if str(REPO_ROOT) not in sys.path:
     sys.path.insert(0, str(REPO_ROOT))
-
-from src.project_paths import A_DATA_ROOT, ensure_directory, resolve_path, SHARED_MODELS_ROOT
-
-
-# ═══════════════════════════════════════════════════════════════════════════════════
-# 常量
-# ═══════════════════════════════════════════════════════════════════════════════════
+from src.project_paths import ensure_directory, resolve_path
 
 NUM_LAYERS = 36
-NUM_HEADS = 28
-HEAD_DIM = 128  # hidden_size / num_heads = 3584 / 28
+NUM_HEADS = 32
+HEAD_DIM = 128
 
 
-# ═══════════════════════════════════════════════════════════════════════════════════
-# CLI
-# ═══════════════════════════════════════════════════════════════════════════════════
-
-def build_parser() -> argparse.ArgumentParser:
-    p = argparse.ArgumentParser(
-        description="仅针对 start/end 时间数字 token 的梯度归因（target logit 目标，36层分批）"
-    )
-    p.add_argument("--filtered-json", type=str, default=None)
-    p.add_argument("--model-path", type=str, default=None)
-    p.add_argument("--video-dir", type=str, default=None)
-    p.add_argument("--output-dir", type=str,
-                   default=str(A_DATA_ROOT / "outputs" / "startend_gradient_head_attr"))
-
-    # 采样控制
-    p.add_argument("--max-samples", type=int, default=50,
-                   help="从 jsonl 中最多加载的样本数（候选池大小）。"
-                        "配合 --max-valid-samples 使用时应设大一些，"
-                        "保证候选池里有足够多的短视频可以过滤。")
-    p.add_argument("--max-valid-samples", type=int, default=0,
-                   help="实际要跑满的有效样本数（通过时长过滤 + 成功处理的）。"
-                        "0 表示不限制，跑完 --max-samples 加载的全部。"
-                        "配合 --max-duration 使用：先把 --max-samples 设大"
-                        "（如 5000），再用 --max-valid-samples 100 控制"
-                        "'跑满 100 个 30s 以内的视频就停'。")
-    p.add_argument("--fps", type=float, default=2.0,
-                   help="视频采样帧率")
-    p.add_argument("--max-frames", type=int, default=0,
-                   help="每个视频最多保留的帧数，超出时覆盖完整时间轴均匀采样；"
-                        "不足时全部保留。0 表示在 total-tokens>0 时根据 "
-                        "2*total_tokens/min_tokens 自动计算。")
-    p.add_argument("--max-side", type=int, default=224,
-                   help="采帧后 resize 长边上限，控制 visual token 数量")
-    p.add_argument("--min-tokens", type=int, default=64,
-                   help="每帧最小视觉 token 预算；与微调/评估保持一致")
-    p.add_argument("--total-tokens", type=int, default=3584,
-                   help="整段视频视觉 token 总预算；>0 时禁用 max-side resize")
-    p.add_argument("--max-duration", type=float, default=30.0,
-                   help="只对 ffprobe 探测到时长 ≤ 此值（秒）的视频做 head 探测，"
-                        "超过则跳过（ffprobe 失败也跳过）。设 0 关闭过滤，处理全部视频。")
-
-    # 归因参数
-    p.add_argument("--top-k", type=int, default=20,
-                   help="最终输出的 Top-K 关键 Head 数量")
-    p.add_argument("--min-attn-ratio", type=float, default=1.0,
-                   help="attn_align（baseline_ratio，是随机基线的几倍）的"
-                        "绝对下限。低于这个值的 head 说明它对 GT 区间的"
-                        "关注还不如完全随机瞎分配，不管按层归一化后排第几，"
-                        "combined 分数直接清零、不进 Top-K 候选。默认 1.0"
-                        "（严格及格线：不低于随机水平）。设成 0 可关闭这道"
-                        "过滤，退化回纯按层归一化排名。")
-    p.add_argument("--grad-only-top-k", type=int, default=30,
-                   help="额外输出一份纯粹按梯度归因分数（grad_score）单独"
-                        "排名的 Top-K 列表，跟 GT 对齐分数完全无关——是跟"
-                        "combined score、attn_only 都不同的第三条独立"
-                        "候选筛选路径。默认 30，设成 0 可关闭这项输出。")
-    p.add_argument("--attn-only-top-k", type=int, default=30,
-                   help="额外输出一份纯粹按 GT 对齐分数（attn_align）单独"
-                        "排名的 Top-K 列表，跟梯度归因完全无关——是跟"
-                        "combined score、grad_only 都不同的第三条独立"
-                        "候选筛选路径。默认 30，设成 0 可关闭这项输出。")
-    p.add_argument("--layers-per-batch", type=int, default=6,
-                   help="每批处理的层数。36 层默认按 6 层一批 → 6 批，"
-                        "每批独立做一次 forward+backward，用于控制显存。"
-                        "OOM 就调小（如 3 或 2），层数越少批数越多、"
-                        "显存占用越低但耗时越长。")
-
-    # 多卡显存控制
-    p.add_argument("--gpu-mem-gib", type=float, default=16.0,
-                   help="每张 GPU 分配给模型权重的显存上限（GiB）。")
-    p.add_argument("--cpu-mem-gib", type=float, default=64.0,
-                   help="device_map='auto' 允许溢出到 CPU 的显存上限（GiB）。")
-
-    p.add_argument("--force-output-attentions", action="store_true",
-                   help="强制给 model() 调用传 output_attentions=True。"
-                        "默认不传，本脚本用 forward hook 自己拿 attn_weights。"
-                        "如果你环境里 self_attn 是否返回 attn_weights 依赖这个"
-                        "flag（不传就直接 None），遇到 attn_align 全零再打开。")
-
-    return p
+def build_parser():
+    parser = argparse.ArgumentParser(
+        description="Standalone TimeLens-8B GT-only probing; one full model per GPU")
+    parser.add_argument("--filtered-json", required=True)
+    parser.add_argument("--model-path", default="../shared_models/TimeLens-8B")
+    parser.add_argument("--video-dir", required=True)
+    parser.add_argument("--output-dir", required=True)
+    parser.add_argument("--max-samples", type=int, default=500)
+    parser.add_argument("--max-valid-samples", type=int, default=0)
+    parser.add_argument("--max-duration", type=float, default=0.0)
+    parser.add_argument("--fps", type=float, default=2.0)
+    parser.add_argument("--min-tokens", type=int, default=64)
+    parser.add_argument("--total-tokens", type=int, default=14336)
+    parser.add_argument("--max-side", type=int, default=224)
+    parser.add_argument("--top-k", type=int, default=30)
+    parser.add_argument("--min-gt-ratio", type=float, default=1.0)
+    parser.add_argument("--score-eps", type=float, default=1e-8)
+    parser.add_argument("--timelens-model", action="store_true", default=True,
+                        help="TimeLens prompt/processor (already enabled by default)")
+    return parser
 
 
-# ═══════════════════════════════════════════════════════════════════════════════════
-# 视频采帧（与原版一致）
-# ═══════════════════════════════════════════════════════════════════════════════════
+def load_model_and_processor(model_dir):
+    """Load one complete TimeLens model; preserve its processor resize settings."""
+    import torch
+    from transformers import AutoModelForImageTextToText, AutoProcessor
 
-def sample_frames(video_path: Path, fps: float) -> list:
-    """从视频中提取帧，返回 PIL Image 列表。"""
+    processor = AutoProcessor.from_pretrained(
+        str(model_dir), trust_remote_code=True, local_files_only=True,
+        padding_side="left", do_resize=False)
+    model = AutoModelForImageTextToText.from_pretrained(
+        str(model_dir), dtype=torch.bfloat16, attn_implementation="sdpa",
+        device_map={"": "cuda:0"}, trust_remote_code=True, local_files_only=True)
+    model.eval()
+    model.config.use_cache = False
+    text_config = getattr(model.config, "text_config", model.config)
+    text_config.use_cache = False
+    n_layers = len(model.model.language_model.layers)
+    validate_head_layout(model)
+    print(f"  [model] TimeLens-8B / SDPA: full rank-local model on cuda:0, {n_layers} layers")
+    return model, processor, n_layers
+
+
+def make_video_metadata(native_fps, total_frames, indices, backend):
+    """Qwen 的原视频索引/FPS 时间约定；不允许静默以请求采样 FPS 代替。"""
+    if not np.isfinite(native_fps) or native_fps <= 0 or total_frames <= 0:
+        raise ValueError("视频原始 FPS/总帧数无效，不能可靠构建时间轴")
+    if not indices or any(i < 0 or i >= total_frames for i in indices):
+        raise ValueError("采样原始帧索引为空或越界")
+    if any(b <= a for a, b in zip(indices, indices[1:])):
+        raise ValueError("采样原始帧索引必须严格递增")
+    return {"fps": float(native_fps), "total_num_frames": int(total_frames),
+            "frames_indices": [int(i) for i in indices],
+            "duration": float(total_frames / native_fps), "video_backend": backend}
+
+
+def sample_frames(video_path: Path, fps: float) -> Tuple[list, dict]:
+    """返回 PIL 帧及原始索引/FPS 元数据。抽帧策略保留原实现。"""
+    if not np.isfinite(fps) or fps <= 0:
+        raise ValueError("采样 FPS 必须为有限正数")
     try:
         import decord
         decord.bridge.set_bridge("torch")
         vr = decord.VideoReader(str(video_path), ctx=decord.cpu(0))
         native_fps = vr.get_avg_fps()
+        if not np.isfinite(native_fps) or native_fps <= 0:
+            raise ValueError("decord 未提供有效原始 FPS")
         step = max(1, int(native_fps / fps))
         indices = list(range(0, len(vr), step))
+        metadata = make_video_metadata(native_fps, len(vr), indices, "decord")
         frames_t = vr.get_batch(indices)
         from PIL import Image
-        return [Image.fromarray(frames_t[i].numpy()) for i in range(len(indices))]
+        return [Image.fromarray(frames_t[i].numpy()) for i in range(len(indices))], metadata
     except ImportError:
         pass
     try:
         import cv2
         from PIL import Image
         cap = cv2.VideoCapture(str(video_path))
-        if not cap.isOpened():
-            raise RuntimeError(f"无法打开视频：{video_path}")
-        native_fps = cap.get(cv2.CAP_PROP_FPS) or fps
-        step = max(1, int(native_fps / fps))
-        indices = list(range(0, int(cap.get(cv2.CAP_PROP_FRAME_COUNT)), step))
-        frames = []
-        for idx in indices:
-            cap.set(cv2.CAP_PROP_POS_FRAMES, idx)
-            ret, frame = cap.read()
-            if not ret:
-                break
-            frames.append(Image.fromarray(cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)))
-        cap.release()
-        return frames
+        try:
+            if not cap.isOpened():
+                raise RuntimeError(f"无法打开视频：{video_path}")
+            native_fps = cap.get(cv2.CAP_PROP_FPS)
+            if not np.isfinite(native_fps) or native_fps <= 0:
+                raise ValueError("OpenCV 未提供有效原始 FPS")
+            total_frames = int(cap.get(cv2.CAP_PROP_FRAME_COUNT))
+            step = max(1, int(native_fps / fps))
+            indices = list(range(0, total_frames, step))
+            metadata = make_video_metadata(native_fps, total_frames, indices, "opencv")
+            frames = []
+            for idx in indices:
+                if not cap.set(cv2.CAP_PROP_POS_FRAMES, idx):
+                    raise RuntimeError(f"OpenCV 无法定位原始帧 {idx}")
+                ret, frame = cap.read()
+                if not ret:
+                    raise RuntimeError(f"OpenCV 解码原始帧 {idx} 失败；不使用截短视频")
+                decoded_idx = int(round(cap.get(cv2.CAP_PROP_POS_FRAMES))) - 1
+                if decoded_idx != idx:
+                    raise RuntimeError(f"OpenCV 帧定位不一致：请求 {idx}，实际 {decoded_idx}")
+                frames.append(Image.fromarray(cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)))
+            return frames, metadata
+        finally:
+            cap.release()
     except ImportError:
         pass
     sys.exit("ERROR 请安装 decord 或 opencv-python")
 
 
-def uniform_subsample_frames(frames: list, max_frames: int) -> list:
-    """覆盖完整时间轴均匀采样；未超过上限时保留全部帧。"""
-    if max_frames <= 0 or len(frames) <= max_frames:
-        return frames
-    indices = np.rint(
-        np.linspace(0, len(frames) - 1, num=max_frames)
-    ).astype(np.int64)
-    return [frames[int(i)] for i in indices]
+def metadata_for_processor(metadata: dict, frame_count: int, processed_count: int) -> dict:
+    """覆盖 qwen-vl-utils 的伪元数据；允许奇数帧末尾复制一次的官方补齐。"""
+    indices = list(metadata["frames_indices"])
+    if not indices or len(indices) != frame_count:
+        raise ValueError("processor 输入帧数与原始索引不一致")
+    if processed_count not in {frame_count, frame_count + frame_count % 2}:
+        raise RuntimeError("视觉预处理改变了帧数，无法保证原始时间索引对应")
+    indices.extend([indices[-1]] * (processed_count - frame_count))
+    return {**metadata, "frames_indices": indices}
 
 
-def resolve_max_frames(max_frames: int, total_tokens: int,
-                       min_tokens: int) -> int:
-    """根据 Qwen3-VL 的两帧 temporal merge 推导安全帧数上限。"""
-    if max_frames > 0:
-        return max_frames
-    if total_tokens <= 0 or min_tokens <= 0:
-        return 0
-    derived = (2 * total_tokens) // min_tokens
-    return max(2, derived - derived % 2)
+def verify_video_timestamps(processor, inputs, metadata: dict):
+    """检查最终 token 中的时间标记，避免依赖版本静默丢失原始元数据。"""
+    merge = int(processor.video_processor.temporal_patch_size)
+    indices = list(metadata["frames_indices"])
+    indices.extend([indices[-1]] * ((-len(indices)) % merge))
+    expected = [f"{(indices[i] / metadata['fps'] + indices[i + merge - 1] / metadata['fps']) / 2:.1f}"
+                for i in range(0, len(indices), merge)]
+    decoded = processor.tokenizer.decode(inputs["input_ids"][0].tolist(), skip_special_tokens=False)
+    # 只匹配紧邻视觉起始 token 的时间标签，避免 query 文字中出现同格式造成误判。
+    actual = re.findall(r"<([0-9]+(?:\.[0-9]+)?) seconds>\s*<\|vision_start\|>", decoded)
+    if actual != expected:
+        raise RuntimeError(f"processor 时间标记不匹配原视频索引："
+                           f"expected={expected[:3]}...{expected[-3:]} ({len(expected)}), "
+                           f"actual={actual[:3]}...{actual[-3:]} ({len(actual)})")
+    return expected
 
 
 def resize_frames(frames: list, max_side: int = 336) -> list:
@@ -241,78 +203,197 @@ def get_duration_ffprobe(video_path) -> Optional[float]:
         return None
 
 
-# ═══════════════════════════════════════════════════════════════════════════════════
-# 模型加载（与原版一致）
-# ═══════════════════════════════════════════════════════════════════════════════════
-
-def load_model_and_processor(model_dir: Path, gpu_mem_gib: float = 21.0,
-                              cpu_mem_gib: float = 64.0):
-    """加载 Qwen3-VL 模型（eager 模式，必须获取 attention weights）。"""
-    import torch
-    from transformers import AutoModelForImageTextToText, AutoProcessor
-
-    processor = AutoProcessor.from_pretrained(
-        str(model_dir), trust_remote_code=True, local_files_only=True,
-    )
-    if hasattr(processor, 'video_processor'):
-        processor.video_processor.size['shortest_edge'] = 128
-    if hasattr(processor, 'image_processor'):
-        processor.image_processor.size['shortest_edge'] = 128
-
-    n_gpus = torch.cuda.device_count()
-    max_memory = {}
-    if n_gpus >= 1:
-        per_gpu_limit = f"{gpu_mem_gib:g}GiB"
-        for i in range(n_gpus):
-            max_memory[i] = per_gpu_limit
-        max_memory["cpu"] = f"{cpu_mem_gib:g}GiB"
-        gpu_names = [torch.cuda.get_device_name(i) for i in range(n_gpus)]
-        print(f"  [model] 检测到 {n_gpus} 张 GPU: {gpu_names}")
-        print(f"  [model] 均衡加载: max_memory={max_memory}")
-
-    model = AutoModelForImageTextToText.from_pretrained(
-        str(model_dir),
-        dtype=torch.bfloat16,
-        attn_implementation="eager",  # ← eager 才能拿到 attention weights
-        device_map="auto",
-        max_memory=max_memory if max_memory else None,
-        trust_remote_code=True,
-        local_files_only=True,
-    )
-    model.eval()
-    n_layers = len(model.model.language_model.layers)
-
-    from collections import Counter
-    layer_devices = Counter()
+def validate_head_layout(model) -> Tuple[int, int, int]:
+    """从 text_config 读取并逐层校验 query/KV head 布局；拒绝旧 28-head 模型。"""
+    cfg = getattr(model.config, "text_config", model.config)
+    num_heads = int(cfg.num_attention_heads)
+    if num_heads != NUM_HEADS:
+        raise ValueError(
+            f"本脚本要求 Qwen3-VL-8B 的 {NUM_HEADS} query heads，"
+            f"但模型配置是 {num_heads}；请检查 --model-path。"
+        )
+    head_dim = getattr(cfg, "head_dim", None)
+    if head_dim is None:
+        if int(cfg.hidden_size) % num_heads:
+            raise ValueError("hidden_size 不能整除 num_attention_heads")
+        head_dim = int(cfg.hidden_size) // num_heads
+    head_dim = int(head_dim)
+    num_kv_heads = int(getattr(cfg, "num_key_value_heads", num_heads))
+    if head_dim <= 0 or num_kv_heads <= 0 or num_heads % num_kv_heads:
+        raise ValueError("无效的 head_dim / GQA 配置")
     for i, layer in enumerate(model.model.language_model.layers):
-        layer_devices[str(layer.self_attn.o_proj.weight.device)] += 1
-    print(f"  [model] 加载完成：{n_layers} layers, {NUM_HEADS} heads, {HEAD_DIM} head_dim")
-    print(f"  [model] language_model.layers 分布: {dict(layer_devices)}")
-    if n_gpus >= 1:
-        for i in range(n_gpus):
-            allocated = torch.cuda.memory_allocated(i) / 1024**3
-            reserved = torch.cuda.memory_reserved(i) / 1024**3
-            print(f"    GPU{i} 当前显存: allocated={allocated:.2f}GiB "
-                  f"reserved={reserved:.2f}GiB")
-    return model, processor, n_layers
+        expected = {
+            "q_proj": (num_heads * head_dim, int(cfg.hidden_size)),
+            "k_proj": (num_kv_heads * head_dim, int(cfg.hidden_size)),
+            "v_proj": (num_kv_heads * head_dim, int(cfg.hidden_size)),
+            "o_proj": (int(cfg.hidden_size), num_heads * head_dim),
+        }
+        for name, shape in expected.items():
+            actual = tuple(getattr(layer.self_attn, name).weight.shape)
+            if actual != shape:
+                raise ValueError(f"L{i}.{name} shape={actual}，配置要求 {shape}")
+    return num_heads, head_dim, num_kv_heads
+
+
+def get_prediction_positions(target_positions: list[int], seq_len: int) -> list[int]:
+    """所有有效目标 token 各自左移一次；logit 函数仍接收原始目标位置 P。"""
+    return sorted({int(p) - 1 for p in target_positions if 0 < int(p) < seq_len})
+
+
+def attention_kernel_context(backend: str):
+    """禁止 SDPA 静默回退到二次显存的 math 内核；不支持则显式报错。"""
+    if backend == "eager":
+        return nullcontext()
+    from torch.nn.attention import sdpa_kernel, SDPBackend
+    return sdpa_kernel([SDPBackend.FLASH_ATTENTION, SDPBackend.EFFICIENT_ATTENTION])
+
+
+def video_ratios_from_masses(gt_mass, video_mass, gt_counts, video_counts,
+                            min_video_mass=1e-8):
+    """[H,Q] 条件富集倍数；float64，无分母 epsilon、无裁剪、无层内归一化。
+
+    极低视频 mass、不可见 GT/video 或非有限输入返回 NaN，由新排名单独记覆盖数。
+    不改变旧分数或旧样本有效性。GT/video counts 均指该 query 因果可见的 key。
+    """
+    if not np.isfinite(min_video_mass) or not 0 <= min_video_mass <= 1:
+        raise ValueError("min_video_mass 必须在 [0,1] 内")
+    g, v = np.broadcast_arrays(np.asarray(gt_mass, dtype=np.float64),
+                               np.asarray(video_mass, dtype=np.float64))
+    ng, nv = np.broadcast_arrays(np.asarray(gt_counts, dtype=np.float64),
+                                 np.asarray(video_counts, dtype=np.float64))
+    valid = (np.isfinite(g) & np.isfinite(v) & (g >= 0) & (v > min_video_mass)
+             & (g <= v) & np.isfinite(ng) & np.isfinite(nv) & (ng > 0) & (nv >= ng))
+    result = np.full(g.shape, np.nan, dtype=np.float64)
+    # 两次条件归一化必须同时做，不能仅将 N_all 替换为 N_video。
+    share = np.divide(g, v, out=np.zeros_like(g), where=valid)
+    baseline = np.divide(ng, nv, out=np.zeros_like(ng), where=(nv > 0))
+    np.divide(share, baseline, out=result, where=valid)
+    return result
+
+
+def video_attention_statistics(rows, query_positions, video_positions,
+                               gt_key_positions, min_video_mass=1e-8):
+    """rows=[H,Q,S]：复用已取得的 attention 行，只传回小型 CPU 统计。"""
+    import torch
+    with torch.no_grad():
+        q = torch.tensor(query_positions, device=rows.device)
+        v = torch.tensor(video_positions, device=rows.device)
+        g = torch.tensor(gt_key_positions, device=rows.device)
+        v_visible = v[None, :] <= q[:, None]
+        g_visible = g[None, :] <= q[:, None]
+        # 在 attention 原始精度之上以 float64 求和，减少条件比值的累计误差。
+        vm = (rows.index_select(-1, v) * v_visible[None]).sum(-1, dtype=torch.float64).cpu().numpy()
+        gm = (rows.index_select(-1, g) * g_visible[None]).sum(-1, dtype=torch.float64).cpu().numpy()
+        gt_counts = g_visible.sum(-1).cpu().numpy().astype(np.float64)
+        video_counts = v_visible.sum(-1).cpu().numpy().astype(np.float64)
+        ratio = video_ratios_from_masses(
+            gm, vm, gt_counts, video_counts, min_video_mass)
+        baseline = np.divide(gt_counts, video_counts,
+                             out=np.zeros_like(gt_counts), where=video_counts > 0)
+        return {"ratio": ratio, "video_mass": vm, "gt_mass": gm,
+                "gt_fraction_baseline": baseline}
+
+
+def sample_gt_alignment_score(stats: dict, eps: float = 1e-8) -> np.ndarray:
+    """截图公式：样本内先对 query 平均，再做 GT/video mass 与基线比值。"""
+    gt_mass = np.asarray(stats["gt_mass"], dtype=np.float64)
+    video_mass = np.asarray(stats["video_mass"], dtype=np.float64)
+    baseline = np.asarray(stats["gt_fraction_baseline"], dtype=np.float64)
+    if gt_mass.ndim != 2 or video_mass.shape != gt_mass.shape:
+        raise ValueError("GT/video attention mass 必须为匹配的 [H,Q]")
+    if baseline.ndim != 1 or baseline.shape[0] != gt_mass.shape[1]:
+        raise ValueError("均匀基线必须为匹配的 [Q]")
+    mean_video = video_mass.mean(axis=1)
+    valid = (np.isfinite(gt_mass).all(axis=1) & np.isfinite(video_mass).all(axis=1)
+             & np.isfinite(baseline).all() & (mean_video > eps)
+             & (baseline.mean() > 0))
+    score = np.full(gt_mass.shape[0], np.nan, dtype=np.float64)
+    score[valid] = ((gt_mass.mean(axis=1)[valid] / (mean_video[valid] + eps))
+                    / (baseline.mean() + eps))
+    return score
+
+
+def selected_attention_ratios(module, query, key, attention_mask,
+                              query_positions, gt_key_positions, scaling,
+                              video_positions=None, min_video_mass=1e-8):
+    """直接使用官方 attention 接口处已完成 QK norm/RoPE 的 Q/K。
+
+    仅生成 [B,H,Q_selected,S]。分母覆盖所有可见 key，而非只在 GT 内 softmax。
+    仅支持本脚本 B=1、无 KV cache 的完整序列，不重建位置编码或改变模型前向。
+    """
+    import torch
+    if query.shape[0] != 1 or key.shape[0] != 1 or query.shape[2] != key.shape[2]:
+        raise RuntimeError("selected-row attribution requires B=1, full sequence, no KV cache")
+    with torch.no_grad():
+        q_idx = torch.tensor(query_positions, device=query.device)
+        g_idx = torch.tensor(gt_key_positions, device=query.device)
+        q = query.detach().index_select(2, q_idx)
+        k = key.detach()
+        if q.shape[1] % k.shape[1]:
+            raise RuntimeError("Invalid query/KV head ratio")
+        k = k.repeat_interleave(q.shape[1] // k.shape[1], dim=1)
+        scale = scaling if scaling is not None else query.shape[-1] ** -0.5
+        scores = torch.matmul(q, k.transpose(-1, -2)) * scale
+        visible = torch.arange(k.shape[2], device=query.device)[None, :] <= q_idx[:, None]
+        if attention_mask is not None:
+            if attention_mask.ndim != 4 or attention_mask.shape[-1] < k.shape[2]:
+                raise RuntimeError("Expected None or 4D SDPA attention mask")
+            mask = attention_mask[..., :k.shape[2]]
+            if mask.shape[-2] != 1:
+                if mask.shape[-2] != query.shape[2]:
+                    raise RuntimeError("Attention mask query length mismatch")
+                mask = mask.index_select(-2, q_idx.to(mask.device))
+            mask = mask.to(scores.device)
+            if mask.dtype == torch.bool:
+                scores = scores.masked_fill(~mask, float("-inf"))
+            else:
+                scores = scores + mask
+        # In this pipeline the LM is causal, including when SDPA omits its mask.
+        if not getattr(module, "is_causal", True):
+            raise RuntimeError("Only causal text attention can be probed")
+        scores = scores.masked_fill(~visible[None, None], float("-inf"))
+        weights = torch.softmax(scores, dim=-1, dtype=torch.float32).to(query.dtype)
+        gt_visible = visible.index_select(-1, g_idx)
+        mass = (weights.index_select(-1, g_idx).float() * gt_visible[None, None]).sum(-1)
+        baseline = gt_visible.sum(-1).float() / (q_idx.float() + 1)
+        if (baseline <= 0).any():
+            raise RuntimeError("No causally visible GT keys")
+        original_ratio = (mass[0] / baseline[None]).cpu()
+        if video_positions is None:
+            return original_ratio
+        return original_ratio, video_attention_statistics(
+            weights[0], query_positions, video_positions, gt_key_positions, min_video_mass)
 
 
 def build_inputs(processor, frames: list, query: str, duration: float,
                  device, sample_fps: float,
                  gt_start: float = 0.0, gt_end: float = 0.0,
-                 min_tokens: int = 64, total_tokens: int = 3584) -> dict:
-    """构建模型输入。返回 processor 输出 dict + prompt_len + answer_text。"""
+                 min_tokens: int = 64, total_tokens: int = 3584,
+                 video_metadata: Optional[dict] = None,
+                 timelens_model: bool = False) -> dict:
+    """构建并校验含原视频时间轴的输入；原始 metadata 必须显式传入。"""
     from qwen_vl_utils import process_vision_info
+    if video_metadata is None:
+        raise ValueError("必须提供原始视频帧索引/FPS，不能按采样后帧号伪造时间轴")
 
     answer_text = _format_answer(query, duration, frames, sample_fps,
                                   gt_start=gt_start, gt_end=gt_end)
-    user_text = (
-        f"You are given a video with multiple frames. The numbers before each video "
-        f"frame indicate its sampling timestamp (in seconds). Please find the visual "
-        f"event described by the sentence '{query}', determining its starting and "
-        f"ending times. The format should be: "
-        f"'The event happens in <start time> - <end time> seconds'."
-    )
+    if timelens_model:
+        # TimeLens-8B 的 GRPO / 官方评测 prompt；不要加入基础模型使用的 system
+        # prompt 或“帧前时间编号”说明，否则探测分布会和推理分布不一致。
+        user_text = (
+            f"Please find the visual event described by the sentence '{query}', determining its "
+            "starting and ending times. The format should be: 'The event happens in "
+            "<start time> - <end time> seconds'."
+        )
+    else:
+        user_text = (
+            f"You are given a video with multiple frames. The numbers before each video "
+            f"frame indicate its sampling timestamp (in seconds). Please find the visual "
+            f"event described by the sentence '{query}', determining its starting and "
+            f"ending times. The format should be: "
+            f"'The event happens in <start time> - <end time> seconds'."
+        )
 
     video_content = {"type": "video", "video": frames,
                      "sample_fps": sample_fps}
@@ -322,18 +403,18 @@ def build_inputs(processor, frames: list, query: str, duration: float,
         video_content["min_pixels"] = min_tokens * patch_pixels
         video_content["total_pixels"] = total_tokens * patch_pixels
 
-    messages = [
+    user_turn = {"role": "user", "content": [
+        video_content,
+        {"type": "text", "text": user_text},
+    ]}
+    assistant_turn = {"role": "assistant", "content": [
+        {"type": "text", "text": answer_text}
+    ]}
+    messages = ([user_turn, assistant_turn] if timelens_model else [
         {"role": "system", "content": [
             {"type": "text", "text": "You are a video time analysis assistant."}
-        ]},
-        {"role": "user", "content": [
-            video_content,
-            {"type": "text", "text": user_text},
-        ]},
-        {"role": "assistant", "content": [
-            {"type": "text", "text": answer_text}
-        ]},
-    ]
+        ]}, user_turn, assistant_turn
+    ])
 
     text_input = processor.apply_chat_template(
         messages, tokenize=False, add_generation_prompt=False,
@@ -348,12 +429,19 @@ def build_inputs(processor, frames: list, query: str, duration: float,
         video_tensors, video_metadatas = zip(*video_inputs)
         video_tensors, video_metadatas = list(video_tensors), list(video_metadatas)
     else:
-        video_tensors, video_metadatas = video_inputs, None
+        raise RuntimeError("视觉预处理没有返回视频")
+    if len(video_tensors) != 1:
+        raise RuntimeError("当前归因仅支持每条样本一个视频")
+    # 工具对 PIL 列表自动生成连续编号；必须覆盖为我们保存的原视频坐标。
+    source_metadata = metadata_for_processor(video_metadata, len(frames), int(video_tensors[0].shape[0]))
+    video_metadatas = [source_metadata]
 
     scalar_video_kwargs = {
         k: (v[0] if isinstance(v, (list, tuple)) and len(v) == 1 else v)
         for k, v in video_kwargs.items()
     }
+    scalar_video_kwargs.pop("fps", None)
+    scalar_video_kwargs["do_sample_frames"] = False
 
     inputs = processor(
         text=[text_input],
@@ -364,6 +452,11 @@ def build_inputs(processor, frames: list, query: str, duration: float,
         return_tensors="pt",
         **scalar_video_kwargs,
     )
+    timestamps = verify_video_timestamps(processor, inputs, source_metadata)
+    print(f"    [time] 原始 fps={source_metadata['fps']:.6g}，"
+          f"source_indices={source_metadata['frames_indices'][0]}..{source_metadata['frames_indices'][-1]}，"
+          f"模型时间标记={timestamps[0]}..{timestamps[-1]}s，"
+          f"共 {len(timestamps)} 个时间块（已校验）")
 
     return inputs, text_input, answer_text
 
@@ -472,10 +565,6 @@ def get_token_positions(input_ids: list[int], processor) -> dict:
     }
 
 
-# ═══════════════════════════════════════════════════════════════════════════════════
-# 新增：定位 start / end 数字 token（本脚本的核心区别之一）
-# ═══════════════════════════════════════════════════════════════════════════════════
-
 def locate_start_end_token_positions(input_ids: list[int], token_info: dict,
                                      processor, gt_start: float,
                                      gt_end: float) -> dict:
@@ -576,408 +665,6 @@ def compute_gt_video_token_range(gt_start: float, gt_end: float,
     gt_tok_e = min(gt_tok_e, n_video)
     return gt_tok_s, gt_tok_e
 
-
-def compute_target_logit_sum(logits, input_ids, positions: list[int]):
-    """
-    Teacher-forcing 下 start/end 数字 token 的 target logit 求和。
-
-    对每个 position p（数字 token 在完整序列里的下标），预测它的是
-    位置 p-1 的隐状态，所以取 logits[0, p-1, input_ids[0, p]] —— 也就是
-    模型在预测这个 token 时，真实答案这个类别拿到的原始 logit 值。
-    把 start/end 涉及的所有这类 token 的 logit 加总，得到一个标量，
-    用于 backward。与 CE loss（对数概率 + 归一化 + 取负 + 平均）不同，
-    这里直接用原始 logit，不做 softmax 归一化，更贴近"这个 head/神经元
-    对这个具体类别的原始得分有多大贡献"这个问题。
-    """
-    total = None
-    used = 0
-    for p in positions:
-        if p <= 0 or p >= logits.shape[1]:
-            continue
-        tgt_id = input_ids[0, p]
-        val = logits[0, p - 1, tgt_id]
-        total = val if total is None else total + val
-        used += 1
-    return total, used
-
-
-# ═══════════════════════════════════════════════════════════════════════════════════
-# 核心：梯度归因器（36 层分批 retain_grad）
-# ═══════════════════════════════════════════════════════════════════════════════════
-
-class StartEndHeadAttributor:
-    """
-    梯度归因器：每次只给一批层挂 hook，独立做一次 forward+backward。
-
-    与原版 GradientHeadAttributor 的区别：
-      - attach_hooks() 接受显式的 layer_indices 列表（一批），而不是
-        hook_interval 抽样。
-      - compute_head_scores_batch() 只用 start/end token 位置做 query，
-        grad_score 和 attn_align 两部分都用这批位置，不再用全部 answer
-        token。
-    """
-
-    def __init__(self, model, n_layers: int, num_heads: int, head_dim: int):
-        self.model = model
-        self.n_layers = n_layers
-        self.num_heads = num_heads
-        self.head_dim = head_dim
-
-        self.fwd_data: Dict[int, dict] = {}
-        self.grad_data: Dict[int, dict] = {}
-        self.hooks = []
-
-    def _make_forward_hook(self, layer_idx: int):
-        def hook(module, args, output):
-            if isinstance(output, tuple) and len(output) >= 2:
-                attn_output = output[0]   # (batch, seq, hidden)
-                attn_weights = output[1]  # (batch, heads, seq, seq)
-
-                if attn_weights is not None:
-                    self.fwd_data[layer_idx] = {
-                        "attn_weights": attn_weights.detach().float().cpu(),
-                        "attn_output": attn_output.detach().float().cpu(),
-                    }
-                else:
-                    self.fwd_data[layer_idx] = {
-                        "attn_weights": None,
-                        "attn_output": attn_output.detach().float().cpu(),
-                    }
-
-                def grad_hook(grad):
-                    self.grad_data[layer_idx] = {
-                        "grad_output": grad.detach().float().cpu(),
-                    }
-                attn_output.register_hook(grad_hook)
-
-        return hook
-
-    def attach_hooks(self, layer_indices: list[int]):
-        """只给指定的这批层挂 hook。"""
-        count = 0
-        for i, layer in enumerate(self.model.model.language_model.layers):
-            if i not in layer_indices:
-                continue
-            h = layer.self_attn.register_forward_hook(self._make_forward_hook(i))
-            self.hooks.append(h)
-            count += 1
-        print(f"    [hooks] 本批已注册 {count}/{len(layer_indices)} 层 attention hook "
-              f"(layers={layer_indices})")
-
-    def remove_hooks(self):
-        for h in self.hooks:
-            h.remove()
-        self.hooks.clear()
-        self.fwd_data.clear()
-        self.grad_data.clear()
-
-    def compute_head_scores_batch(self, layer_indices: list[int],
-                                  target_positions: list[int],
-                                  n_video: int, gt_tok_s: int,
-                                  gt_tok_e: int) -> Dict[int, Tuple[np.ndarray, np.ndarray]]:
-        """
-        针对本批已经 hook 到数据的层，计算 grad_score 与 attn_align——
-        query 位置统一用 start/end 数字 token（对这些 token 求均值）。
-
-        grad_score(l,h) = mean_{p∈start∪end}( |fwd_h[p] · grad_h[p]| )
-
-        attn_align(l,h) = mean_{p∈start∪end}( ratio_p )，其中：
-          ratio_p = GT_mass_p / baseline_p
-          GT_mass_p = sum_{k∈gt_tok_s:gt_tok_e}( attn[h, p, k] )   ← GT 区间
-              总共拿到的注意力质量（sum，不是 mean）
-          baseline_p = n_gt_tok / (p + 1)  ← 因果 attention 下，query token
-              p 一共能看到 (p+1) 个 key（0..p）。如果完全不挑、按 token
-              数量均匀分配，GT 这 n_gt_tok 个 key 理论上应该拿到这么多
-              份额。ratio_p 就是"实际拿到的份额是均匀分配的几倍"。
-
-          直接用 ratio 而不是原始 GT_mass 的原因：baseline_p 这个分母
-          只取决于 query token p 的序列位置和 GT 区间大小，样本之间的
-          视频长度、GT 时长占比差异很大，会导致这个分母在样本间大幅
-          波动。如果直接对原始 GT_mass 做跨样本平均，长视频/小 GT 占比
-          样本和短视频/大 GT 占比样本的数值不可比，均值会被这种上下文
-          差异污染；换成 ratio 后再跨样本平均，是在"是随机水平的几倍"
-          这个统一单位上比较，才是公平的。
-
-        返回 {layer_idx: (head_grad[num_heads], head_attn[num_heads])}
-        """
-        results: Dict[int, Tuple[np.ndarray, np.ndarray]] = {}
-        pos_arr = np.array(sorted(set(target_positions)), dtype=np.int64)
-        if len(pos_arr) == 0:
-            return results
-
-        n_gt_tok = max(gt_tok_e - gt_tok_s, 1)
-
-        for l in layer_indices:
-            if l not in self.fwd_data or l not in self.grad_data:
-                continue
-
-            fwd = self.fwd_data[l]
-            grad = self.grad_data[l]
-
-            attn_w = fwd["attn_weights"]
-            fwd_out = fwd.get("attn_output")   # (1, seq, hidden) CPU tensor
-            grad_out = grad.get("grad_output")  # (1, seq, hidden) CPU tensor
-
-            head_grad = np.zeros(self.num_heads, dtype=np.float32)
-            head_attn = np.zeros(self.num_heads, dtype=np.float32)
-
-            if attn_w is not None:
-                attn_w_cpu = attn_w[0].numpy()  # (heads, seq, seq)
-                n_heads_actual = min(attn_w_cpu.shape[0], self.num_heads)
-                seq_len = attn_w_cpu.shape[1]
-            else:
-                attn_w_cpu = None
-                n_heads_actual = self.num_heads
-                seq_len = fwd_out.shape[1] if fwd_out is not None else 0
-
-            valid_pos = pos_arr[pos_arr < seq_len] if seq_len > 0 else pos_arr
-            # 每个 query token 自己的因果基线：n_gt_tok / (p + 1)
-            baseline_per_pos = (n_gt_tok / (valid_pos.astype(np.float64) + 1.0)
-                                if len(valid_pos) > 0 else np.array([]))
-
-            for h in range(n_heads_actual):
-                # ---- grad_score：Taylor 一阶近似，只在 start/end token 上算 ----
-                if grad_out is not None and fwd_out is not None and len(valid_pos) > 0:
-                    h_fwd = fwd_out[0, :, h * self.head_dim:(h + 1) * self.head_dim]
-                    h_grad = grad_out[0, :, h * self.head_dim:(h + 1) * self.head_dim]
-                    pos_fwd = h_fwd[valid_pos]
-                    pos_grad = h_grad[valid_pos]
-                    taylor = (pos_fwd * pos_grad).sum(dim=-1).abs().mean()
-                    head_grad[h] = float(taylor)
-
-                # ---- attn_align：query=start/end token，key=GT 视频区间，
-                #      GT 区间总质量 sum 后除以该 query token 的因果基线 ----
-                if attn_w_cpu is not None and seq_len >= n_video and len(valid_pos) > 0:
-                    head_attn_mat = attn_w_cpu[h]  # (seq, seq)
-                    video_slice = head_attn_mat[valid_pos, :n_video]
-                    gt_mass = video_slice[:, gt_tok_s:gt_tok_e].sum(axis=1)  # (n_pos,)
-                    ratio = gt_mass / np.maximum(baseline_per_pos, 1e-12)
-                    head_attn[h] = float(ratio.mean())
-
-            results[l] = (head_grad, head_attn)
-
-        return results
-
-
-def normalize_and_combine(grad_score: np.ndarray, attn_align: np.ndarray,
-                          min_attn_ratio: float = 1.0) -> np.ndarray:
-    """按层归一化后取 min，并加一道绝对下限过滤：
-
-    按层 min-max 归一化只回答"在本层 28 个 head 里排第几"，不回答
-    "这个值本身好不好"——如果某一层所有 head 的 attn_align（baseline_
-    ratio）普遍都低于 1.0（也就是比完全随机瞎分配还更不关注 GT），
-    归一化照样会把里面矬子里最高的那个拉到 1.0，跟真正在深层大幅
-    超过随机基线（比如 3 倍）的 head 拿到同样的归一化满分，两者在
-    combined 分数上就没有区分度了，会把"层内虚高但绝对值不及格"的
-    假阳性头排进 Top-K。
-
-    加的这道过滤：凡是原始 attn_align < min_attn_ratio（默认 1.0，
-    也就是不如随机基线）的 head，不管它按层归一化后排第几，直接把
-    combined 清零，从候选里剔除。
-    """
-    eps = 1e-9
-
-    def _normalize_per_layer(matrix: np.ndarray) -> np.ndarray:
-        normed = np.zeros_like(matrix)
-        for l in range(matrix.shape[0]):
-            row_max = matrix[l].max()
-            if row_max > eps:
-                normed[l] = matrix[l] / row_max
-        return normed
-
-    combined = np.minimum(_normalize_per_layer(grad_score), _normalize_per_layer(attn_align))
-    combined[attn_align < min_attn_ratio] = 0.0
-    return combined
-
-
-def select_top_grad_only(mean_grad: np.ndarray, top_k: int = 30) -> List[dict]:
-    """
-    纯粹按梯度归因分数（grad_score）单独排名，跟 attn_align 完全无关——
-    是跟 combined_score（要求两边都强）、attn_only（纯看 attn）并列的
-    第三条独立候选筛选路径中的一条：只看"这个 head 的输出对 target
-    logit 的梯度响应强不强"，不管它生成 start/end 数字时 attention 有
-    没有真的看向 GT 视频区间。
-
-    做法：先按层 min-max 归一化（纠正深度带来的数值尺度差异——层越浅
-    梯度链式累积得越少，原始数值天然偏小，不归一化直接全局排名会系统性
-    偏向深层），归一化后在全体 36×28 个 head 里统一排名，取前 top_k。
-
-    这类 head 可能是"确实参与了决定最终答案数字、但注意力模式本身不
-    一定直接盯着 GT 视频段"的 head——比如做数值计算/格式化、或者从别的
-    head 已经聚合好的信息里做进一步处理，跟 attn_only 选出来的那批
-    "负责读取视频信息"的 head 角色可能完全不同。
-    """
-    eps = 1e-9
-    n_layers, n_heads = mean_grad.shape
-
-    grad_norm = np.zeros_like(mean_grad)
-    for l in range(n_layers):
-        row_max = mean_grad[l].max()
-        if row_max > eps:
-            grad_norm[l] = mean_grad[l] / row_max
-
-    flat_norm = grad_norm.ravel()
-    order = np.argsort(-flat_norm)[:top_k]
-
-    results: List[dict] = []
-    for rank, fi in enumerate(order):
-        l, h = divmod(int(fi), n_heads)
-        results.append({
-            "rank": rank + 1,
-            "layer": int(l),
-            "head": int(h),
-            "grad_score": round(float(mean_grad[l, h]), 6),
-            "grad_score_norm": round(float(grad_norm[l, h]), 6),
-        })
-    return results
-
-
-def select_top_attn_only(mean_attn: np.ndarray, top_k: int = 30,
-                         min_attn_ratio: float = 1.0) -> List[dict]:
-    """
-    纯粹按 GT 对齐分数（attn_align，即"是随机基线的几倍"）单独排名，
-    跟 grad_score 完全无关——不是 combined score 那种要求两边都强，
-    是跟 combined score、grad_only 并列的第三条独立候选筛选路径：
-    只要求"这个 head 生成 start/end 数字时，attention 真的显著聚焦到了
-    GT 视频区间"，不管它的梯度响应强不强。
-
-    这类 head 可能是"参与信息读取但本身不是 loss 主要梯度路径"的
-    head——比如只负责把视频信息搬运到某个中间表示、真正的决策/写入
-    发生在别的 head，这种角色梯度归因未必能捕捉到，但纯粹的 attention
-    对齐可以。跟 grad_only、combined score 的候选列表放在一起看，
-    可以检查这三条路径选出的 head 有多少重叠、多少是各自独有的。
-
-    过滤：跟其他两条路径一致，attn_align < min_attn_ratio（默认 1.0，
-    不如随机基线）的 head 不进候选池。
-    """
-    n_layers, n_heads = mean_attn.shape
-    candidates = [(l, h) for l in range(n_layers) for h in range(n_heads)
-                 if mean_attn[l, h] >= min_attn_ratio]
-    if not candidates:
-        return []
-
-    candidates_sorted = sorted(
-        candidates, key=lambda lh: -mean_attn[lh[0], lh[1]],
-    )
-
-    results: List[dict] = []
-    for rank, (l, h) in enumerate(candidates_sorted[:top_k]):
-        results.append({
-            "rank": rank + 1,
-            "layer": int(l),
-            "head": int(h),
-            "attn_align": round(float(mean_attn[l, h]), 6),
-        })
-    return results
-
-
-def freeze_non_essential_params(model) -> list[str]:
-    """
-    整个脚本从头到尾都不需要任何"权重"的梯度——我们只通过 hook 拿
-    decoder attention 输出这个"激活值"的梯度，backward 不需要经过任何
-    参数的 dW 计算。把 vision tower / embed_tokens / lm_head 的参数
-    requires_grad 全部关掉：
-
-      - vision tower 处理的帧数往往很多（本例 1568 个 video token），
-        如果它的权重还 requires_grad=True，整个视觉编码器的前向都会被
-        autograd 记录、为反传保留一份完整的激活值副本——这是比 decoder
-        attention weights 更大的显存黑洞，而且每一批（batch）都要重新
-        跑一次完整 forward，等于每批都要重复背负这份显存，是当前 OOM
-        最主要的来源之一。关掉 requires_grad 之后，只要权重和输入
-        pixel_values 都不需要梯度，PyTorch 根本不会为这部分建反传图，
-        视觉编码器前向会退化成类似 inference 模式的显存占用。
-      - decoder layers（model.model.language_model.layers）的权重保持
-        requires_grad=True 不动：正是靠着"当前 batch 起，后续每一层
-        权重都 requires_grad=True"，才能让梯度图从被冻结的前置层
-        （FreezeLayersNoGrad 包住的 no_grad 层）之后重新连接起来，这是
-        整个分批方案能生效的前提，绝对不能一起冻结。
-    """
-    frozen = []
-    visual = None
-    for name in ("visual", "vision_tower", "vision_model", "vision_encoder"):
-        visual = getattr(model.model, name, None)
-        if visual is not None:
-            for p in visual.parameters():
-                p.requires_grad_(False)
-            frozen.append(f"model.{name}")
-            break
-    if visual is None:
-        print("  [WARN] 没找到 vision tower 子模块（试过 visual/vision_tower/"
-              "vision_model/vision_encoder），如果显存仍然紧张，请检查模型"
-              "结构，手动把视觉编码器权重的 requires_grad 关掉。")
-
-    lm = model.model.language_model
-    if hasattr(lm, "embed_tokens"):
-        for p in lm.embed_tokens.parameters():
-            p.requires_grad_(False)
-        frozen.append("language_model.embed_tokens")
-
-    if hasattr(model, "lm_head"):
-        for p in model.lm_head.parameters():
-            p.requires_grad_(False)
-        frozen.append("lm_head")
-
-    print(f"  [model] 已冻结 requires_grad=False：{frozen}"
-          f"（decoder layers 权重保持可训练，用于梯度定位）")
-    return frozen
-
-
-def make_layer_batches(n_layers: int, layers_per_batch: int) -> List[List[int]]:
-    return [list(range(i, min(i + layers_per_batch, n_layers)))
-            for i in range(0, n_layers, layers_per_batch)]
-
-
-class FreezeLayersNoGrad:
-    """
-    临时把"当前批次之前"的那些层的 forward 包进 torch.no_grad()，执行完
-    以后再还原，用来真正切断反向传播图（而不是只决定给哪些层挂 hook）。
-
-    重要说明——这个优化只对"批次靠后"的情况有实质性省显存效果：
-      - 对某个 batch，它后面（batch 结束层号 ~ 第 35 层）的所有层，
-        无论如何都必须保持 requires_grad 参与正常前向，因为 target
-        logit 的梯度要一路反传回这个 batch，这部分显存没法省。
-      - 只有 batch 之前的那些层可以冻结进 no_grad，省掉它们的
-        attention weights / 激活值在反向图里的驻留。
-      - 所以 batch 覆盖的层号越靠前（比如第一批 layer 0-5），它后面
-        剩下的 30 层依然要全部保留梯度，跟不分批时几乎一样费显存；
-        batch 越靠后（比如最后一批 layer 30-35），前面能冻结掉的层
-        越多，省显存效果越明显。这是反向传播本身的结构性限制，
-        不是实现问题——如果连最前面几层的 batch 都 OOM，靠调小
-        --layers-per-batch 是无法绕开的，需要改用更短的视频/更低的
-        --max-side、--fps 来压 seq_len（attention weights 显存跟
-        seq_len 是平方关系，收益最大）。
-    """
-
-    def __init__(self, layers, freeze_indices: list[int]):
-        self.layers = layers
-        self.freeze_indices = freeze_indices
-        self._originals: dict[int, object] = {}
-
-    def __enter__(self):
-        import torch
-
-        for i in self.freeze_indices:
-            layer = self.layers[i]
-            orig_forward = layer.forward
-            self._originals[i] = orig_forward
-
-            def wrapped(*args, _orig=orig_forward, **kwargs):
-                with torch.no_grad():
-                    return _orig(*args, **kwargs)
-
-            layer.forward = wrapped
-        return self
-
-    def __exit__(self, exc_type, exc_val, exc_tb):
-        for i, orig in self._originals.items():
-            self.layers[i].forward = orig
-        self._originals.clear()
-        return False
-
-
-# ═══════════════════════════════════════════════════════════════════════════════════
-# 样本加载（与原版一致）
-# ═══════════════════════════════════════════════════════════════════════════════════
 
 def _resolve_video_path(video_dir: Path, s: dict) -> Optional[Path]:
     """按样本定位视频文件。优先用 video_rel_path（训练集视频在子目录下），
@@ -1121,109 +808,6 @@ def load_samples(filtered_json: Path, video_dir: Path,
     return sample_list
 
 
-# ═══════════════════════════════════════════════════════════════════════════════════
-# 可视化（与原版一致）
-# ═══════════════════════════════════════════════════════════════════════════════════
-
-def save_heatmaps(combined: np.ndarray, grad_score: np.ndarray,
-                  attn_align: np.ndarray, top_k: int,
-                  n_samples: int, output_dir: Path):
-    import matplotlib
-    matplotlib.use("Agg")
-    import matplotlib.pyplot as plt
-
-    titles = [
-        ("Combined Score (Gradient x Attention, start/end tokens)", combined),
-        ("Gradient Norm Score (start/end tokens)", grad_score),
-        ("Attention Alignment Score (start/end tokens)", attn_align),
-    ]
-
-    for fig_title, matrix in titles:
-        top_k_mask = np.zeros_like(matrix, dtype=bool)
-        flat = matrix.ravel()
-        for fi in np.argsort(flat)[::-1][:top_k]:
-            l, h = divmod(int(fi), matrix.shape[1])
-            top_k_mask[l, h] = True
-
-        fig, axes = plt.subplots(1, 2, figsize=(18, 8),
-                                 gridspec_kw={"width_ratios": [3, 1]})
-        ax = axes[0]
-        im = ax.imshow(matrix, aspect="auto", cmap="YlOrRd", origin="upper")
-        plt.colorbar(im, ax=ax, fraction=0.03, pad=0.02)
-        rows, cols = np.where(top_k_mask)
-        ax.scatter(cols, rows, marker="*", color="blue", s=80, zorder=5,
-                   label=f"Top-{top_k} heads")
-        ax.set_xlabel("Head index", fontsize=11)
-        ax.set_ylabel("Layer index", fontsize=11)
-        ax.set_title(f"{fig_title}\n({n_samples} samples)", fontsize=12)
-        ax.legend(fontsize=9)
-
-        ax2 = axes[1]
-        layer_max = matrix.max(axis=1)
-        layer_mean = matrix.mean(axis=1)
-        ax2.plot(layer_max, np.arange(len(layer_max)), marker="o", markersize=4,
-                 label="Max score", color="crimson")
-        ax2.plot(layer_mean, np.arange(len(layer_mean)), marker="s", markersize=3,
-                 label="Mean score", color="steelblue")
-        ax2.set_xlabel("Score", fontsize=10)
-        ax2.set_ylabel("Layer index", fontsize=10)
-        ax2.set_title("Score distribution per layer", fontsize=11)
-        ax2.invert_yaxis()
-        ax2.legend(fontsize=9)
-        ax2.grid(True, alpha=0.3)
-
-        plt.tight_layout()
-        slug = fig_title.lower().replace(" ", "_").replace("x", "x").replace("(", "").replace(")", "").replace("/", "_")
-        out_path = output_dir / f"startend_gradient_head_{slug}.png"
-        out_path.parent.mkdir(parents=True, exist_ok=True)
-        plt.savefig(str(out_path), dpi=150, bbox_inches="tight")
-        plt.close(fig)
-        print(f"  -> 热力图：{out_path}")
-
-
-def save_per_layer_detail(combined: np.ndarray, grad_score: np.ndarray,
-                           attn_align: np.ndarray, top_k: int,
-                           output_dir: Path):
-    import matplotlib
-    matplotlib.use("Agg")
-    import matplotlib.pyplot as plt
-
-    n_layers, n_heads = combined.shape
-
-    fig, axes = plt.subplots(3, 1, figsize=(24, 12), sharex=True)
-    for ax_idx, (title, matrix) in enumerate([
-        ("Combined Score", combined),
-        ("Gradient Norm Score", grad_score),
-        ("Attention Alignment", attn_align),
-    ]):
-        ax = axes[ax_idx]
-        x = np.arange(n_layers)
-        top1_vals = matrix.max(axis=1)
-        top1_heads = matrix.argmax(axis=1)
-        bars = ax.bar(x, top1_vals, color=plt.cm.YlOrRd(top1_vals / max(top1_vals.max(), 1e-9)))
-        ax.set_ylabel(title, fontsize=10)
-        ax.set_title(f"Per-layer best head: {title}", fontsize=11)
-        ax.grid(axis="y", alpha=0.3)
-
-        for i in range(n_layers):
-            if top1_vals[i] > 0:
-                ax.annotate(f"H{top1_heads[i]}", (i, top1_vals[i]),
-                           textcoords="offset points", xytext=(0, 3),
-                           fontsize=6, ha="center", rotation=90, color="darkred")
-
-    axes[-1].set_xlabel("Layer index", fontsize=11)
-    axes[-1].set_xticks(range(0, n_layers, 2))
-    plt.tight_layout()
-    out_path = output_dir / "startend_gradient_head_per_layer.png"
-    plt.savefig(str(out_path), dpi=150, bbox_inches="tight")
-    plt.close(fig)
-    print(f"  -> 逐层详情图：{out_path}")
-
-
-# ═══════════════════════════════════════════════════════════════════════════════════
-# 显存清理工具（与原版一致）
-# ═══════════════════════════════════════════════════════════════════════════════════
-
 def deep_gpu_cleanup(n_gpus: int):
     import torch
     gc.collect()
@@ -1235,765 +819,259 @@ def deep_gpu_cleanup(n_gpus: int):
             torch.cuda.synchronize()
 
 
-def print_gpu_memory(n_gpus: int, tag: str = ""):
+class StartEndHeadAttributor:
+    """Capture only timestamp query attention rows from official post-RoPE Q/K."""
+    def __init__(self, model, n_layers: int, num_heads: int, head_dim: int,
+                 attention_backend: str = "sdpa", min_video_mass: float = 1e-8):
+        self.model = model
+        self.n_layers = n_layers
+        self.num_heads = num_heads
+        self.head_dim = head_dim
+        self.fwd_data: Dict[int, dict] = {}
+        self.hooks = []
+        self.tensor_hooks = []
+        self.query_positions: list[int] = []
+        self.gt_key_positions: list[int] = []
+        self.video_positions: list[int] = []
+        self.min_video_mass = min_video_mass
+        self.seq_len = 0
+        self.n_video = 0
+        self.gt_range = None
+        self.attention_backend = attention_backend
+        self._attention_registry = None
+        self._original_sdpa = None
+
+    def set_sample_context(self, target_positions, video_positions,
+                           gt_tok_s, gt_tok_e, seq_len):
+        """GT 范围是 video 内部索引；映射成 attention 的绝对 key 列索引。"""
+        queries = get_prediction_positions(target_positions, seq_len)
+        video_positions = np.asarray(video_positions, dtype=np.int64)
+        if not queries:
+            raise ValueError("没有可归因的时间戳预测位置 p-1")
+        if (video_positions.ndim != 1 or len(video_positions) == 0
+                or np.any(video_positions < 0)
+                or np.any(video_positions >= seq_len)
+                or np.any(np.diff(video_positions) <= 0)):
+            raise ValueError("video_positions 必须是递增且有效的真实序列位置")
+        if not 0 <= gt_tok_s < gt_tok_e <= len(video_positions):
+            raise ValueError("GT 视频内部 token 范围无效")
+        gt_keys = video_positions[gt_tok_s:gt_tok_e].tolist()
+        if any(not any(k <= q for k in gt_keys) for q in queries):
+            raise ValueError("时间戳 query 看不到任何 GT 视频 key")
+        self.query_positions = queries
+        self.gt_key_positions = gt_keys
+        self.video_positions = video_positions.tolist()
+        self.seq_len = int(seq_len)
+        self.n_video = len(video_positions)
+        self.gt_range = (gt_tok_s, gt_tok_e)
+
+    def attach_gt_only_hooks(self, layer_indices: list[int]):
+        """只捕获 SDPA 时间戳 query 行；不挂激活/梯度 hook，不需要 backward。"""
+        if not self.query_positions:
+            raise RuntimeError("请先调用 set_sample_context")
+        if self.attention_backend != "sdpa":
+            raise ValueError("纯 GT 探测固定使用 SDPA")
+        self.remove_hooks()
+        try:
+            from transformers.modeling_utils import ALL_ATTENTION_FUNCTIONS
+            original = ALL_ATTENTION_FUNCTIONS["sdpa"]
+            targets = {id(self.model.model.language_model.layers[i].self_attn): i
+                       for i in layer_indices}
+
+            def capture_sdpa(module, query, key, value, attention_mask,
+                             dropout=0.0, scaling=None, **kwargs):
+                layer_idx = targets.get(id(module))
+                if layer_idx is not None:
+                    if module.training or dropout:
+                        raise RuntimeError("GT probing requires eval mode with dropout=0")
+                    original_ratio, video_stats = selected_attention_ratios(
+                        module, query, key, attention_mask,
+                        self.query_positions, self.gt_key_positions, scaling,
+                        self.video_positions, self.min_video_mass)
+                    self.fwd_data.setdefault(layer_idx, {}).update(
+                        attn_ratio=original_ratio, video_stats=video_stats)
+                return original(module, query, key, value, attention_mask,
+                                dropout=dropout, scaling=scaling, **kwargs)
+
+            self._attention_registry = ALL_ATTENTION_FUNCTIONS
+            self._original_sdpa = original
+            ALL_ATTENTION_FUNCTIONS.register("sdpa", capture_sdpa)
+        except Exception:
+            self.remove_hooks()
+            raise
+        print(f"    [hooks] 全 {len(layer_indices)} 层：仅 GT attention；"
+              f"query_count={len(self.query_positions)}")
+
+    def remove_hooks(self):
+        if self._attention_registry is not None:
+            self._attention_registry.register("sdpa", self._original_sdpa)
+            self._attention_registry = None
+            self._original_sdpa = None
+        for handle in self.hooks + self.tensor_hooks:
+            handle.remove()
+        self.hooks.clear()
+        self.tensor_hooks.clear()
+        self.fwd_data.clear()
+
+
+def _run_rank_gt(args, rank, world_size):
+    """单次 SDPA forward 统计全部层/head，只写 video_only_head_attribution.json。"""
+    if args.top_k < 0 or args.min_gt_ratio < 0 or args.score_eps < 0:
+        raise ValueError("top-k、min-gt-ratio 和 score-eps 必须非负")
     import torch
-    parts = []
-    for gi in range(n_gpus):
-        allocated = torch.cuda.memory_allocated(gi) / 1024**3
-        reserved = torch.cuda.memory_reserved(gi) / 1024**3
-        parts.append(f"GPU{gi}: alloc={allocated:.2f}G/res={reserved:.2f}G")
-    print(f"    [mem{(' ' + tag) if tag else ''}] " + "  ".join(parts))
 
-
-# ═══════════════════════════════════════════════════════════════════════════════════
-# 主流程
-# ═══════════════════════════════════════════════════════════════════════════════════
-
-def _run_local_attribution(argv=None):
-    args = build_parser().parse_args(argv)
-    import torch
-
-    filtered_json = resolve_path(
-        args.filtered_json or (
-            A_DATA_ROOT / "outputs" / "pre_sample" / "filtered_samples.json"
-        ),
-        default=A_DATA_ROOT / "outputs" / "pre_sample" / "filtered_samples.json",
-        must_exist=True,
-    )
-    model_dir = resolve_path(
-        args.model_path or (SHARED_MODELS_ROOT / "Qwen3-VL-8B-Instruct"),
-        default=SHARED_MODELS_ROOT / "Qwen3-VL-8B-Instruct",
-        must_exist=True,
-    )
-    video_dir = resolve_path(
-        args.video_dir or (A_DATA_ROOT / "datasets" / "Test" / "Charades_sta" / "charades"),
-        default=A_DATA_ROOT / "datasets" / "Test" / "Charades_sta" / "charades",
-        must_exist=True,
-    )
+    filtered_json = resolve_path(args.filtered_json, must_exist=True)
+    model_dir = resolve_path(args.model_path, must_exist=True)
+    video_dir = resolve_path(args.video_dir, must_exist=True)
     output_dir = ensure_directory(resolve_path(args.output_dir))
+    output_path = output_dir / "video_only_head_attribution.json"
 
     n_gpus = torch.cuda.device_count()
-    print(f"CUDA: {torch.cuda.is_available()}  |  GPU 数量: {n_gpus}")
-    for gi in range(n_gpus):
-        print(f"    GPU{gi}: {torch.cuda.get_device_name(gi)}")
+    print(f"CUDA={torch.cuda.is_available()}，GPU={n_gpus}；纯 GT/SDPA，无 backward")
+    model, processor, n_layers = load_model_and_processor(model_dir)
+    device = model.get_input_embeddings().weight.device
+    num_heads, head_dim, num_kv_heads = validate_head_layout(model)
+    all_samples = load_samples(filtered_json, video_dir, args.max_samples)
+    samples = all_samples[rank::world_size]
+    print(f"[distributed] rank={rank}/{world_size}: global={len(all_samples)}, local={len(samples)}")
+    attributor = StartEndHeadAttributor(
+        model, n_layers, num_heads, head_dim,
+        attention_backend="sdpa", min_video_mass=args.score_eps)
 
-    print(f"\n加载模型（eager 模式，均衡分配到 {n_gpus} 张 GPU）：{model_dir}")
-    model, processor, n_layers = load_model_and_processor(
-        model_dir, gpu_mem_gib=args.gpu_mem_gib, cpu_mem_gib=args.cpu_mem_gib,
-    )
-    device = model.device
-    freeze_non_essential_params(model)
-
-    sample_list = load_samples(filtered_json, video_dir, args.max_samples)
-    print(f"\n候选样本池大小：{len(sample_list)}")
-    if args.max_valid_samples > 0:
-        print(f"目标有效样本数：{args.max_valid_samples}（攒够即停）")
-
-    layer_batches = make_layer_batches(n_layers, args.layers_per_batch)
-    print(f"36 层分为 {len(layer_batches)} 批处理：{layer_batches}")
-
-    attributor = StartEndHeadAttributor(model, n_layers, NUM_HEADS, HEAD_DIM)
-
-    sum_combined = np.zeros((n_layers, NUM_HEADS), dtype=np.float64)
-    sum_grad = np.zeros((n_layers, NUM_HEADS), dtype=np.float64)
-    sum_attn = np.zeros((n_layers, NUM_HEADS), dtype=np.float64)
-    hit_count = np.zeros((n_layers, NUM_HEADS), dtype=np.int64)
-    valid_count = 0
-    failures = 0
+    shape = (n_layers, num_heads)
+    sum_score = np.zeros(shape, dtype=np.float64)
+    sum_gt_mass = np.zeros(shape, dtype=np.float64)
+    sum_video_mass = np.zeros(shape, dtype=np.float64)
+    valid_counts = np.zeros(shape, dtype=np.int64)
+    valid_count = failures = duration_skipped = 0
     duration_cache: Dict[str, Optional[float]] = {}
-    duration_skipped = 0
-    duration_unknown = 0
+    frame_limit = 0  # No extra frame cap after 2 FPS sampling.
+    started = time.time()
 
-    print(f"\n{'='*60}")
-    print(f"开始 start/end token 梯度归因（候选池={len(sample_list)} 样本，"
-          f"目标={args.max_valid_samples if args.max_valid_samples > 0 else '全部'} 有效样本，"
-          f"目标=target logit，36层分{len(layer_batches)}批）")
-    print(f"{'='*60}")
-
-    t_start = time.time()
-
-    for idx, s in enumerate(sample_list):
-        # ── early stop：攒够指定数量的有效样本就停 ──
+    for idx, sample in enumerate(samples):
         if args.max_valid_samples > 0 and valid_count >= args.max_valid_samples:
-            print(f"\n  已达到 --max-valid-samples={args.max_valid_samples}，提前停止"
-                  f"（扫描了候选池中 {idx}/{len(sample_list)} 个样本）")
             break
-
+        frames = inputs = outputs = None
         try:
-            # 1. 采帧（训练集视频在子目录下，用 _resolve_video_path 定位）
-            video_path = _resolve_video_path(video_dir, s)
+            video_path = _resolve_video_path(video_dir, sample)
             if video_path is None:
-                print("    SKIP（视频文件缺失）")
-                failures += 1
+                raise FileNotFoundError("视频文件缺失")
+            cache_key = str(video_path)
+            if cache_key not in duration_cache:
+                duration_cache[cache_key] = get_duration_ffprobe(video_path)
+            probed_duration = duration_cache[cache_key]
+            if (args.max_duration > 0 and probed_duration is not None
+                    and probed_duration > args.max_duration):
+                duration_skipped += 1
                 continue
 
-            # 时长过滤：ffprobe 探测真实时长，只保留 ≤ --max-duration 的视频
-            if args.max_duration > 0:
-                vp = str(video_path)
-                if vp not in duration_cache:
-                    duration_cache[vp] = get_duration_ffprobe(video_path)
-                dur = duration_cache[vp]
-                if dur is None:
-                    print("    SKIP（ffprobe 无法获取时长）")
-                    duration_unknown += 1
-                    continue
-                if dur > args.max_duration:
-                    print(f"    SKIP（时长 {dur:.1f}s > {args.max_duration:.1f}s）")
-                    duration_skipped += 1
-                    continue
-                s["probed_duration"] = dur
-
-            frames = sample_frames(video_path, args.fps)
-            sampled_frame_count = len(frames)
-            # 训练集没有 duration 字段时，用采帧结果反推视频时长
-            duration = float(s.get("duration") or 0.0)
-            if duration <= 0:
-                duration = sampled_frame_count / max(args.fps, 1e-6)
-
-            frame_limit = resolve_max_frames(
-                args.max_frames, args.total_tokens, args.min_tokens)
-            if frame_limit > 0 and sampled_frame_count > frame_limit:
-                frames = uniform_subsample_frames(frames, frame_limit)
-                print(f"    [frames] {sampled_frame_count} -> {len(frames)} "
-                      f"（完整时间轴均匀采样，上限={frame_limit}）")
+            frames, metadata = sample_frames(video_path, args.fps)
+            duration = float(probed_duration if probed_duration is not None
+                             else metadata["duration"])
+            metadata["duration"] = duration
             if args.total_tokens <= 0:
-                frames = resize_frames(frames, max_side=args.max_side)
-            if not frames:
-                failures += 1
-                continue
+                frames = resize_frames(frames, args.max_side)
 
-            # 2. 构建输入
-            inputs, text_input, answer_text = build_inputs(
-                processor, frames, s["query"], duration, device, args.fps,
-                gt_start=s["gt_start"], gt_end=s["gt_end"],
+            inputs, _, _ = build_inputs(
+                processor, frames, sample["query"], duration, device, args.fps,
+                gt_start=sample["gt_start"], gt_end=sample["gt_end"],
                 min_tokens=args.min_tokens, total_tokens=args.total_tokens,
-            )
-            input_ids_list = inputs["input_ids"][0].tolist()
-
-            # 3. Token 位置解析 + start/end 数字 token 定位
-            token_info = get_token_positions(input_ids_list, processor)
-
-            # total_pixels 会受每帧最小分辨率和尺寸取整影响，因此第一次
-            # processor 结果仍可能超过 total_tokens。按实测 token 比例继续
-            # 减少帧数、覆盖完整时间轴均匀重采样，直到满足硬上限；不能
-            # 因为超预算直接丢掉训练样本。
-            while (args.total_tokens > 0
-                   and token_info["n_video_tokens"] > args.total_tokens):
-                old_frame_count = len(frames)
-                old_video_tokens = token_info["n_video_tokens"]
-                if old_frame_count <= 2:
-                    raise RuntimeError(
-                        f"最少 2 帧仍产生 {old_video_tokens} video tokens，"
-                        f"无法满足 --total-tokens {args.total_tokens}"
-                    )
-
-                target_frame_count = int(
-                    old_frame_count * args.total_tokens / old_video_tokens)
-                # temporal_patch_size=2，保持偶数帧；同时保证每轮至少减少2帧。
-                target_frame_count = min(
-                    old_frame_count - 2, max(2, target_frame_count))
-                target_frame_count -= target_frame_count % 2
-                target_frame_count = max(2, target_frame_count)
-                frames = uniform_subsample_frames(frames, target_frame_count)
-                print(f"    [token-cap] video token {old_video_tokens} > "
-                      f"{args.total_tokens}，均匀采样帧数 "
-                      f"{old_frame_count} -> {len(frames)}")
-
-                del inputs
-                inputs, text_input, answer_text = build_inputs(
-                    processor, frames, s["query"], duration, device, args.fps,
-                    gt_start=s["gt_start"], gt_end=s["gt_end"],
-                    min_tokens=args.min_tokens, total_tokens=args.total_tokens,
-                )
-                input_ids_list = inputs["input_ids"][0].tolist()
-                token_info = get_token_positions(input_ids_list, processor)
-
+                video_metadata=metadata, timelens_model=args.timelens_model)
             inputs = {k: v.to(device) if isinstance(v, torch.Tensor) else v
                       for k, v in inputs.items()}
-            startend_info = locate_start_end_token_positions(
-                input_ids_list, token_info, processor, s["gt_start"], s["gt_end"],
-            )
-            target_positions = startend_info["start_positions"] + startend_info["end_positions"]
+            ids = inputs["input_ids"][0].tolist()
+            token_info = get_token_positions(ids, processor)
+            if token_info["n_video_tokens"] > args.total_tokens > 0:
+                raise ValueError(f"video token={token_info['n_video_tokens']} 超过 {args.total_tokens}")
+            positions = locate_start_end_token_positions(
+                ids, token_info, processor, sample["gt_start"], sample["gt_end"])
+            target_positions = positions["start_positions"] + positions["end_positions"]
+            if not target_positions or token_info["n_video_tokens"] <= 0:
+                raise ValueError("时间戳 query 或视频 token 为空")
+            gt_s, gt_e = compute_gt_video_token_range(
+                sample["gt_start"], sample["gt_end"], duration,
+                token_info["n_video_tokens"])
+            attributor.set_sample_context(
+                target_positions, np.flatnonzero(token_info["video_mask"]),
+                gt_s, gt_e, inputs["input_ids"].shape[1])
 
-            seq_len = inputs["input_ids"].shape[1]
-            print(f"  [{idx+1}/{len(sample_list)}] "
-                  f"(valid={valid_count}/{args.max_valid_samples if args.max_valid_samples > 0 else '∞'}) "
-                  f"{s['video_id']} "
-                  f"dur={s.get('probed_duration', duration):.1f}s "
-                  f"seq={seq_len} video={token_info['n_video_tokens']} "
-                  f"ans_tok={token_info['n_answer_tokens']} "
-                  f"start_tok={startend_info['start_positions']} "
-                  f"end_tok={startend_info['end_positions']} "
-                  f"GT=[{s['gt_start']:.1f}, {s['gt_end']:.1f}] "
-                  f"'{s['query'][:40]}'")
+            attributor.attach_gt_only_hooks(list(range(n_layers)))
+            with torch.inference_mode(), attention_kernel_context("sdpa"):
+                outputs = model(**inputs)
 
-            if not target_positions:
-                print("    SKIP（未能定位 start/end token）")
-                del inputs, frames
-                deep_gpu_cleanup(n_gpus)
-                failures += 1
-                continue
-
-            n_video = token_info["n_video_tokens"]
-            if n_video <= 0:
-                print("    SKIP（无 video token）")
-                del inputs, frames
-                deep_gpu_cleanup(n_gpus)
-                failures += 1
-                continue
-            gt_tok_s, gt_tok_e = compute_gt_video_token_range(
-                s["gt_start"], s["gt_end"], duration, n_video,
-            )
-
-            # 4. 分批 forward + backward
-            sample_grad = np.zeros((n_layers, NUM_HEADS), dtype=np.float32)
-            sample_attn = np.zeros((n_layers, NUM_HEADS), dtype=np.float32)
-            input_ids_t = inputs["input_ids"]
-
-            decoder_layers = model.model.language_model.layers
-
-            for batch_idx, layer_batch in enumerate(layer_batches):
-                freeze_indices = list(range(0, layer_batch[0]))
-                print(f"    [batch {batch_idx+1}/{len(layer_batches)}] "
-                      f"layers={layer_batch}  frozen(no_grad)={len(freeze_indices)}层  "
-                      f"仍需保留梯度到底={n_layers - layer_batch[0]}层")
-
-                attributor.attach_hooks(layer_batch)
-
-                try:
-                    with FreezeLayersNoGrad(decoder_layers, freeze_indices):
-                        if args.force_output_attentions:
-                            outputs = model(**inputs, output_attentions=True)
-                        else:
-                            outputs = model(**inputs)
-                        logits = outputs.logits  # (1, seq, vocab)
-
-                        target, n_used = compute_target_logit_sum(
-                            logits, input_ids_t, target_positions,
-                        )
-                        if target is None or n_used == 0 or torch.isnan(target):
-                            print(f"    batch{batch_idx} SKIP（target 无效）")
-                            attributor.remove_hooks()
-                            del outputs, logits
-                            model.zero_grad(set_to_none=True)
-                            deep_gpu_cleanup(n_gpus)
-                            continue
-
-                        target.backward()
-                except torch.cuda.OutOfMemoryError as oom:
-                    print(f"    batch{batch_idx} OOM，跳过这一批"
-                          f"（layers={layer_batch}），继续下一批: {oom}")
-                    attributor.remove_hooks()
-                    model.zero_grad(set_to_none=True)
-                    deep_gpu_cleanup(n_gpus)
-                    continue
-
-                batch_results = attributor.compute_head_scores_batch(
-                    layer_batch, target_positions, n_video, gt_tok_s, gt_tok_e,
-                )
-                for l, (hg, ha) in batch_results.items():
-                    sample_grad[l] = hg
-                    sample_attn[l] = ha
-
-                attributor.remove_hooks()
-                del outputs, logits, target
-                model.zero_grad(set_to_none=True)
-                deep_gpu_cleanup(n_gpus)
-
-            print_gpu_memory(n_gpus, tag=f"after sample {idx+1}")
-
-            # 5. 联合分数 + 累积
-            sample_combined = normalize_and_combine(
-                sample_grad, sample_attn, min_attn_ratio=args.min_attn_ratio,
-            )
-            sum_grad += sample_grad.astype(np.float64)
-            sum_attn += sample_attn.astype(np.float64)
-            sum_combined += sample_combined.astype(np.float64)
+            sample_score = np.full(shape, np.nan, dtype=np.float64)
+            sample_gt = np.zeros(shape, dtype=np.float64)
+            sample_video = np.zeros(shape, dtype=np.float64)
+            for layer in range(n_layers):
+                stats = attributor.fwd_data.get(layer, {}).get("video_stats")
+                if stats is None:
+                    raise RuntimeError(f"L{layer} 未捕获 GT attention")
+                sample_score[layer] = sample_gt_alignment_score(stats, args.score_eps)
+                sample_gt[layer] = np.asarray(stats["gt_mass"]).mean(axis=1)
+                sample_video[layer] = np.asarray(stats["video_mass"]).mean(axis=1)
+            finite = np.isfinite(sample_score)
+            sum_score += np.where(finite, sample_score, 0.0)
+            sum_gt_mass += sample_gt
+            sum_video_mass += sample_video
+            valid_counts += finite
             valid_count += 1
-
-            for l in range(n_layers):
-                row = sample_combined[l]
-                row_max = row.max()
-                if row_max >= 0.999:
-                    for h in np.where(row >= row_max - 1e-6)[0]:
-                        hit_count[l, h] += 1
-
-            if sample_combined.max() > 0:
-                top3_idx = np.argsort(sample_combined.ravel())[::-1][:3]
-                top3_str = ", ".join(
-                    f"L{int(fi)//NUM_HEADS}H{int(fi)%NUM_HEADS}={sample_combined.ravel()[fi]:.4f}"
-                    for fi in top3_idx
-                )
-                print(f"    top3: [{top3_str}]")
-
-            del inputs, frames
-            deep_gpu_cleanup(n_gpus)
-
-        except Exception as e:
-            print(f"  FAIL: {e}")
-            attributor.remove_hooks()
-            model.zero_grad(set_to_none=True)
-            deep_gpu_cleanup(n_gpus)
+            best = np.nanargmax(sample_score)
+            layer, head = divmod(int(best), num_heads)
+            print(f"  [{idx+1}/{len(samples)}] valid={valid_count} "
+                  f"{sample['video_id']} Q={len(attributor.query_positions)} "
+                  f"top=L{layer}H{head} score={sample_score[layer, head]:.4f}")
+        except Exception as exc:
             failures += 1
-            continue
-
-    elapsed = time.time() - t_start
+            print(f"  [{idx+1}/{len(samples)}] SKIP: {exc}")
+        finally:
+            attributor.remove_hooks()
+            outputs = inputs = frames = None
+            deep_gpu_cleanup(n_gpus)
 
     if valid_count == 0:
-        print("ERROR: 无有效样本！")
-        return 1
-
-    mean_combined = (sum_combined / valid_count).astype(np.float32)
-    mean_grad = (sum_grad / valid_count).astype(np.float32)
-    mean_attn = (sum_attn / valid_count).astype(np.float32)
-
-    if mean_grad.max() <= 0:
-        print("  [WARN] mean_grad 矩阵全为 0：反向梯度可能没有真正流经 "
-              "attention output（检查 backward hook / target logit 是否为 0）。")
-    if mean_attn.max() <= 0:
-        print("  [WARN] mean_attn 矩阵全为 0：attention 对齐分数没有被计算，"
-              "检查 seq_len / n_video / gt_tok_s:gt_tok_e 的边界。")
-    if mean_combined.max() <= 0:
-        print("  [WARN] mean_combined 矩阵全为 0，Top-K 排名此时没有意义。")
-
-    print(f"\n  [诊断] 跨 {valid_count} 个样本，各 (layer, head) 拿到"
-          f"'本层冠军'的命中次数 Top-15：")
-    hit_flat = hit_count.ravel()
-    hit_top_idx = np.argsort(hit_flat)[::-1][:15]
-    print(f"    {'Layer':>5}  {'Head':>4}  {'Hits':>6}  {'Hit_rate':>9}")
-    for fi in hit_top_idx:
-        l_idx, h_idx = divmod(int(fi), NUM_HEADS)
-        hits = int(hit_flat[fi])
-        if hits == 0:
-            continue
-        print(f"    {l_idx:>5}  {h_idx:>4}  {hits:>6}  {hits/valid_count:>8.1%}")
-
-    grad_layer_max = mean_grad.max(axis=1)
-    attn_layer_max = mean_attn.max(axis=1)
-    print(f"\n  [诊断] 逐层原始最大值（未归一化）：")
-    print(f"    {'Layer':>5}  {'Grad_max':>12}  {'Attn_max':>12}")
-    for l in range(n_layers):
-        print(f"    {l:>5}  {grad_layer_max[l]:>12.6f}  {attn_layer_max[l]:>12.6f}")
-
-    flat = mean_combined.ravel()
-    top_k_idx = np.argsort(flat)[::-1][:args.top_k]
-
-    top_k_heads = []
-    print(f"\n{'='*60}")
-    print(f"Top-{args.top_k} start/end token 梯度归因 Head")
-    print(f"{'='*60}")
-    print(f"  {'Rank':>4}  {'Layer':>5}  {'Head':>4}  "
-          f"{'Combined':>10}  {'Gradient':>10}  {'Attention':>10}")
-    for rank, fi in enumerate(top_k_idx):
-        l_idx, h_idx = divmod(int(fi), NUM_HEADS)
-        top_k_heads.append({
-            "rank": rank + 1,
-            "layer": l_idx,
-            "head": h_idx,
-            "combined_score": round(float(mean_combined[l_idx, h_idx]), 6),
-            "gradient_score": round(float(mean_grad[l_idx, h_idx]), 6),
-            "attention_score": round(float(mean_attn[l_idx, h_idx]), 6),
-        })
-        print(f"  {rank+1:>4}  {l_idx:>5}  {h_idx:>4}  "
-              f"{mean_combined[l_idx, h_idx]:>10.4f}  "
-              f"{mean_grad[l_idx, h_idx]:>10.4f}  "
-              f"{mean_attn[l_idx, h_idx]:>10.4f}")
-
-    # ── 额外输出：纯粹按梯度归因分数（grad_score）单独排名的 Top-K
-    #    （跟 attn 完全无关，是第三条独立候选筛选路径）──
-    grad_only_heads: List[dict] = []
-    if args.grad_only_top_k > 0:
-        grad_only_heads = select_top_grad_only(
-            mean_grad,
-            top_k=args.grad_only_top_k,
-        )
-        print(f"\n{'='*60}")
-        print(f"Top-{args.grad_only_top_k} 纯梯度归因分数 Head "
-              f"(只看 grad_score，跟 GT 对齐无关)")
-        print(f"{'='*60}")
-        print(f"  {'Rank':>4}  {'Layer':>5}  {'Head':>4}  {'GradNorm':>9}  {'GradRaw':>10}")
-        for entry in grad_only_heads:
-            print(f"  {entry['rank']:>4}  {entry['layer']:>5}  {entry['head']:>4}  "
-                  f"{entry['grad_score_norm']:>9.4f}  {entry['grad_score']:>10.4f}")
-        if not grad_only_heads:
-            print("  [WARN] 没有输出纯梯度排名列表。")
-
-    # ── 额外输出：纯粹按 GT 对齐分数（attn_align）单独排名的 Top-K
-    #    （跟 grad 完全无关，是第三条独立候选筛选路径）──
-    attn_only_heads: List[dict] = []
-    if args.attn_only_top_k > 0:
-        attn_only_heads = select_top_attn_only(
-            mean_attn,
-            top_k=args.attn_only_top_k,
-            min_attn_ratio=args.min_attn_ratio,
-        )
-        print(f"\n{'='*60}")
-        print(f"Top-{args.attn_only_top_k} 纯 GT 对齐分数 Head "
-              f"(只看 attn_align，跟梯度归因无关)")
-        print(f"{'='*60}")
-        print(f"  {'Rank':>4}  {'Layer':>5}  {'Head':>4}  {'AttnRatio':>10}")
-        for entry in attn_only_heads:
-            print(f"  {entry['rank']:>4}  {entry['layer']:>5}  {entry['head']:>4}  "
-                  f"{entry['attn_align']:>10.4f}")
-        if not attn_only_heads:
-            print("  [WARN] 候选池为空（可能所有 head 的 attn_align 都低于 "
-                  "--min-attn-ratio），没有输出纯 attn 排名列表。")
-
-    print(f"\n生成可视化...")
-    save_heatmaps(mean_combined, mean_grad, mean_attn,
-                  args.top_k, valid_count, output_dir)
-    save_per_layer_detail(mean_combined, mean_grad, mean_attn,
-                           args.top_k, output_dir)
-
-    result_json = {
+        raise RuntimeError("没有有效样本，未生成结果")
+    mean_score = np.divide(sum_score, valid_counts,
+                           out=np.full(shape, np.nan), where=valid_counts > 0)
+    complete = valid_counts == valid_count
+    candidates = [(l, h) for l in range(n_layers) for h in range(num_heads)
+                  if complete[l, h] and mean_score[l, h] >= args.min_gt_ratio]
+    candidates.sort(key=lambda lh: (-mean_score[lh], lh[0], lh[1]))
+    ranked = [{"rank": rank + 1, "layer": l, "head": h,
+               "video_gt_ratio": float(mean_score[l, h]),
+               "gt_alignment_score": float(mean_score[l, h]),
+               "mean_gt_attention_mass": float(sum_gt_mass[l, h] / valid_count),
+               "mean_video_attention_mass": float(sum_video_mass[l, h] / valid_count),
+               "valid_samples": valid_count}
+              for rank, (l, h) in enumerate(candidates[:args.top_k])]
+    result = {
         "_meta": {
-            "method": "Start/End-token Gradient Attribution "
-                      "(target logit, layer-batched retain_grad)",
-            "formula": "target = sum_p logits[p-1, gt_token[p]] for p in start/end tokens; "
-                       "HIS = E_p[|A_h[p]^T . dTarget/dA_h[p]|]; "
-                       "attn_align = mean_p( sum_k(attn[h,p,gt_tok_s:gt_tok_e]) "
-                       "/ (n_gt_tok/(p+1)) )  [ratio to causal-uniform baseline]; "
-                       "Combined = min(norm(HIS), norm(attn_align))",
-            "n_samples_total": len(sample_list),
-            "n_valid": valid_count,
-            "n_failures": failures,
-            "max_samples": args.max_samples,
-            "max_valid_samples": args.max_valid_samples,
-            "max_duration": args.max_duration,
+            "method": "GT-only video-conditional attention alignment",
+            "model_path": str(model_dir), "timelens_model": True,
+            "formula": "mean_i((mean_q A_GT)/(mean_q A_video + eps)/(mean_q N_GT/N_video + eps))",
+            "gradient_attribution": False,
+            "combined_selection": False,
+            "attention_backend": "sdpa",
+            "query_rows": "all start/end timestamp subtokens at p-1",
+            "fps": args.fps, "max_frames": frame_limit,
+            "min_tokens": args.min_tokens, "total_tokens": args.total_tokens,
+            "score_eps": args.score_eps, "min_gt_ratio": args.min_gt_ratio,
+            "n_valid": valid_count, "n_failures": failures,
             "n_duration_skipped": duration_skipped,
-            "n_duration_unknown": duration_unknown,
-            "top_k": args.top_k,
-            "min_attn_ratio": args.min_attn_ratio,
-            "grad_only_top_k": args.grad_only_top_k,
-            "attn_only_top_k": args.attn_only_top_k,
-            "fps": args.fps,
-            "max_frames": resolve_max_frames(
-                args.max_frames, args.total_tokens, args.min_tokens),
-            "min_tokens": args.min_tokens,
-            "total_tokens": args.total_tokens,
-            "max_side": args.max_side,
-            "layers_per_batch": args.layers_per_batch,
-            "n_layer_batches": len(layer_batches),
-            "num_layers": n_layers,
-            "num_heads": NUM_HEADS,
-            "n_gpus": n_gpus,
-            "gpu_mem_gib": args.gpu_mem_gib,
-            "elapsed_seconds": round(elapsed, 1),
-            "seconds_per_sample": round(elapsed / max(valid_count, 1), 2),
+            "num_layers": n_layers, "num_heads": num_heads,
+            "num_key_value_heads": num_kv_heads, "head_dim": head_dim,
+            "video_timestamp_source": "original_frame_indices/native_fps",
+            "video_timestamps_verified": True,
+            "elapsed_seconds": round(time.time() - started, 1),
         },
-        "top_k_heads": top_k_heads,
-        "grad_only_top_heads": grad_only_heads,
-        "attn_only_top_heads": attn_only_heads,
-        "combined_score_matrix": mean_combined.tolist(),
-        "gradient_score_matrix": mean_grad.tolist(),
-        "attention_alignment_matrix": mean_attn.tolist(),
+        "video_only_top_heads": ranked,
+        "gt_alignment_score_matrix": [
+            [float(v) if np.isfinite(v) else None for v in row] for row in mean_score],
+        "valid_sample_count_matrix": valid_counts.tolist(),
     }
-
-    out_json = output_dir / "startend_gradient_head_attribution.json"
-    out_json.write_text(
-        json.dumps(result_json, indent=2, ensure_ascii=False), encoding="utf-8",
-    )
-    print(f"\n结果 JSON：{out_json}")
-
-    attn_only_top = np.argsort(mean_attn.ravel())[::-1][:args.top_k]
-    combined_set = set(int(fi) for fi in top_k_idx)
-    attn_set = set(int(fi) for fi in attn_only_top)
-    overlap = combined_set & attn_set
-    print(f"\n  Combined vs Attention-only Top-{args.top_k} 重叠: {len(overlap)}/{args.top_k}")
-
-    print(f"\n{'='*60}")
-    print(f"完成  有效样本={valid_count}  失败={failures}  "
-          f"时长过滤跳过={duration_skipped}  时长未知={duration_unknown}  "
-          f"耗时={elapsed:.1f}s  ({elapsed/max(valid_count,1):.1f}s/sample)")
-    print(f"Top-1 Head: L{top_k_heads[0]['layer']}H{top_k_heads[0]['head']}"
-          f"  combined={top_k_heads[0]['combined_score']:.4f}")
-    print(f"{'='*60}")
+    output_path.write_text(json.dumps(result, ensure_ascii=False, indent=2,
+                                      allow_nan=False), encoding="utf-8")
+    print(f"\n完成：{output_path}；有效样本={valid_count}，Top heads={len(ranked)}")
     return 0
-
-def _set_default(argv: List[str], name: str, value: str) -> None:
-    if name not in argv:
-        argv.extend([name, value])
-
-
-def _replace_arg(argv: List[str], name: str, value: str) -> None:
-    if name in argv:
-        idx = argv.index(name)
-        if idx + 1 >= len(argv):
-            raise ValueError(f"{name} 缺少参数值")
-        argv[idx + 1] = value
-    else:
-        argv.extend([name, value])
-
-
-def _build_rank_argv(argv: List[str], rank_dir: Path) -> List[str]:
-    local_argv = list(argv)
-    _set_default(local_argv, "--max-samples", "500")
-    _set_default(local_argv, "--max-valid-samples", "0")
-    _set_default(local_argv, "--max-duration", "0")
-    _set_default(local_argv, "--fps", "2.0")
-    _set_default(local_argv, "--min-tokens", "64")
-    _set_default(local_argv, "--total-tokens", "14336")
-    _set_default(local_argv, "--layers-per-batch", "2")
-    _replace_arg(local_argv, "--output-dir", str(rank_dir))
-    return local_argv
-
-
-def _load_full_model_on_local_gpu(base_module, model_dir: Path,
-                                  gpu_mem_gib: float = 21.0,
-                                  cpu_mem_gib: float = 64.0):
-    del gpu_mem_gib, cpu_mem_gib
-    import torch
-    from transformers import AutoModelForImageTextToText, AutoProcessor
-
-    processor = AutoProcessor.from_pretrained(
-        str(model_dir), trust_remote_code=True, local_files_only=True,
-    )
-    model = AutoModelForImageTextToText.from_pretrained(
-        str(model_dir),
-        dtype=torch.bfloat16,
-        attn_implementation="eager",
-        device_map={"": "cuda:0"},
-        trust_remote_code=True,
-        local_files_only=True,
-    )
-    model.eval()
-    n_layers = len(model.model.language_model.layers)
-    print(f"  [model] rank-local 完整模型: cuda:0, "
-          f"{n_layers} layers, {base_module.NUM_HEADS} heads")
-    return model, processor, n_layers
-
-
-def _make_distributed_loader(base_module, rank: int, world_size: int):
-    original_load_samples = base_module.load_samples
-
-    def distributed_load_samples(filtered_json, video_dir, max_samples):
-        all_samples = original_load_samples(filtered_json, video_dir, max_samples)
-        local_samples = all_samples[rank::world_size]
-        print(f"  [rank {rank}] 全局候选={len(all_samples)}, "
-              f"本 rank={len(local_samples)}")
-        return local_samples
-
-    return distributed_load_samples
-
-
-def _top_combined(mean_combined, mean_grad, mean_attn, top_k: int):
-    import numpy as np
-
-    indices = np.argsort(mean_combined.ravel())[::-1][:top_k]
-    result = []
-    for rank, flat_idx in enumerate(indices, start=1):
-        layer, head = divmod(int(flat_idx), mean_combined.shape[1])
-        result.append({
-            "rank": rank,
-            "layer": layer,
-            "head": head,
-            "combined_score": round(float(mean_combined[layer, head]), 6),
-            "gradient_score": round(float(mean_grad[layer, head]), 6),
-            "attention_score": round(float(mean_attn[layer, head]), 6),
-        })
-    return result
-
-
-def _merge_rank_results(base_module, output_dir: Path, rank_root: Path,
-                        world_size: int, cli_args) -> Path:
-    import numpy as np
-
-    rank_results = []
-    for rank in range(world_size):
-        path = rank_root / f"rank_{rank}" / "startend_gradient_head_attribution.json"
-        if not path.exists():
-            raise FileNotFoundError(f"rank {rank} 未生成结果：{path}")
-        rank_results.append(json.loads(path.read_text(encoding="utf-8")))
-
-    total_valid = sum(int(r["_meta"]["n_valid"]) for r in rank_results)
-    if total_valid <= 0:
-        raise RuntimeError("所有 rank 的有效样本数之和为 0")
-
-    def weighted_matrix(key: str):
-        total = None
-        for result in rank_results:
-            weight = int(result["_meta"]["n_valid"])
-            matrix = np.asarray(result[key], dtype=np.float64)
-            total = matrix * weight if total is None else total + matrix * weight
-        return (total / total_valid).astype(np.float32)
-
-    mean_combined = weighted_matrix("combined_score_matrix")
-    mean_grad = weighted_matrix("gradient_score_matrix")
-    mean_attn = weighted_matrix("attention_alignment_matrix")
-
-    top_k_heads = _top_combined(
-        mean_combined, mean_grad, mean_attn, cli_args.top_k,
-    )
-    grad_only_heads = base_module.select_top_grad_only(
-        mean_grad, top_k=cli_args.grad_only_top_k,
-    ) if cli_args.grad_only_top_k > 0 else []
-    attn_only_heads = base_module.select_top_attn_only(
-        mean_attn,
-        top_k=cli_args.attn_only_top_k,
-        min_attn_ratio=cli_args.min_attn_ratio,
-    ) if cli_args.attn_only_top_k > 0 else []
-
-    meta = dict(rank_results[0]["_meta"])
-    meta.update({
-        "method": meta.get("method", "") + " + torchrun data parallel merge",
-        "distributed": True,
-        "world_size": world_size,
-        "n_gpus": world_size,
-        "n_samples_total": sum(
-            int(r["_meta"]["n_samples_total"]) for r in rank_results
-        ),
-        "n_valid": total_valid,
-        "n_failures": sum(int(r["_meta"]["n_failures"]) for r in rank_results),
-        "n_duration_skipped": sum(
-            int(r["_meta"].get("n_duration_skipped", 0)) for r in rank_results
-        ),
-        "n_duration_unknown": sum(
-            int(r["_meta"].get("n_duration_unknown", 0)) for r in rank_results
-        ),
-        "elapsed_seconds": round(max(
-            float(r["_meta"].get("elapsed_seconds", 0.0)) for r in rank_results
-        ), 1),
-        "per_rank_n_valid": [int(r["_meta"]["n_valid"]) for r in rank_results],
-    })
-
-    merged = {
-        "_meta": meta,
-        "top_k_heads": top_k_heads,
-        "grad_only_top_heads": grad_only_heads,
-        "attn_only_top_heads": attn_only_heads,
-        "combined_score_matrix": mean_combined.tolist(),
-        "gradient_score_matrix": mean_grad.tolist(),
-        "attention_alignment_matrix": mean_attn.tolist(),
-    }
-
-    output_dir.mkdir(parents=True, exist_ok=True)
-    out_json = output_dir / "startend_gradient_head_attribution.json"
-    out_json.write_text(
-        json.dumps(merged, ensure_ascii=False, indent=2), encoding="utf-8",
-    )
-    base_module.save_heatmaps(
-        mean_combined, mean_grad, mean_attn,
-        cli_args.top_k, total_valid, output_dir,
-    )
-    base_module.save_per_layer_detail(
-        mean_combined, mean_grad, mean_attn, cli_args.top_k, output_dir,
-    )
-
-    print("\n" + "=" * 72)
-    print(f"多卡合并完成：world_size={world_size}, valid={total_valid}")
-    print(f"最终 JSON：{out_json}")
-    if top_k_heads:
-        top1 = top_k_heads[0]
-        print(f"Top-1: L{top1['layer']}H{top1['head']} "
-              f"combined={top1['combined_score']:.6f}")
-    print("=" * 72)
-    return out_json
-
-
-def main(argv=None) -> int:
-    argv = list(sys.argv[1:] if argv is None else argv)
-    local_rank = int(os.environ.get("LOCAL_RANK", "0"))
-    rank = int(os.environ.get("RANK", "0"))
-    world_size = int(os.environ.get("WORLD_SIZE", "1"))
-
-    # 必须在首次 import torch/CUDA 前执行。每个 rank 只看见一张物理 GPU，
-    # 因而原脚本中的 cuda:0 就是该 rank 自己的卡，不会发生模型分片。
-    if world_size > 1:
-        visible = os.environ.get("CUDA_VISIBLE_DEVICES")
-        if visible:
-            devices = [x.strip() for x in visible.split(",") if x.strip()]
-            if local_rank >= len(devices):
-                raise RuntimeError(
-                    f"LOCAL_RANK={local_rank} 超出 CUDA_VISIBLE_DEVICES={visible}"
-                )
-            os.environ["CUDA_VISIBLE_DEVICES"] = devices[local_rank]
-        else:
-            os.environ["CUDA_VISIBLE_DEVICES"] = str(local_rank)
-
-    import torch
-    import torch.distributed as dist
-    this_module = sys.modules[__name__]
-
-    if not torch.cuda.is_available():
-        raise RuntimeError("多卡 head 探测要求 CUDA")
-    torch.cuda.set_device(0)
-    if world_size > 1:
-        dist.init_process_group(backend="gloo", init_method="env://")
-
-    parsed = this_module.build_parser().parse_args(argv)
-    output_dir = Path(parsed.output_dir).expanduser().resolve()
-    rank_root = output_dir / "_rank_outputs"
-    rank_dir = rank_root / f"rank_{rank}"
-    rank_dir.mkdir(parents=True, exist_ok=True)
-
-    this_module.load_model_and_processor = lambda model_dir, gpu_mem_gib=21.0, cpu_mem_gib=64.0: (
-        _load_full_model_on_local_gpu(this_module, model_dir, gpu_mem_gib, cpu_mem_gib)
-    )
-    this_module.load_samples = _make_distributed_loader(this_module, rank, world_size)
-
-    print(f"[distributed] rank={rank}/{world_size}, local_rank={local_rank}, "
-          f"visible_gpu={os.environ.get('CUDA_VISIBLE_DEVICES')}")
-    rank_argv = _build_rank_argv(argv, rank_dir)
-    rc = _run_local_attribution(rank_argv)
-    if rc != 0:
-        raise RuntimeError(f"rank {rank} head attribution 失败，return code={rc}")
-
-    if world_size > 1:
-        dist.barrier()
-
-    if rank == 0:
-        effective_args = this_module.build_parser().parse_args(rank_argv)
-        _merge_rank_results(
-            this_module, output_dir, rank_root, world_size, effective_args,
-        )
-
-    if world_size > 1:
-        dist.barrier()
-        dist.destroy_process_group()
-    return 0
-
-
-def _gt_distributed_parser():
-    parser = argparse.ArgumentParser(
-        description="多卡数据并行纯 GT attention head 探测；每 rank 一张卡一份完整模型")
-    parser.add_argument("--filtered-json", required=True)
-    parser.add_argument("--model-path", required=True)
-    parser.add_argument("--video-dir", required=True)
-    parser.add_argument("--output-dir", required=True)
-    parser.add_argument("--max-samples", type=int, default=500)
-    parser.add_argument("--max-valid-samples", type=int, default=0)
-    parser.add_argument("--max-duration", type=float, default=0.0)
-    parser.add_argument("--fps", type=float, default=2.0)
-    parser.add_argument("--min-tokens", type=int, default=64)
-    parser.add_argument("--total-tokens", type=int, default=14336)
-    parser.add_argument("--top-k", type=int, default=30)
-    parser.add_argument("--min-gt-ratio", type=float, default=1.0)
-    parser.add_argument("--score-eps", type=float, default=1e-8)
-    parser.add_argument("--timelens-model", action="store_true")
-    return parser
-
-
-def _gt_rank_model_loader(gt_module, model_dir, **_kwargs):
-    import torch
-    from transformers import AutoModelForImageTextToText, AutoProcessor
-
-    processor = AutoProcessor.from_pretrained(
-        str(model_dir), trust_remote_code=True, local_files_only=True)
-    if hasattr(processor, "video_processor"):
-        processor.video_processor.size["shortest_edge"] = 128
-    if hasattr(processor, "image_processor"):
-        processor.image_processor.size["shortest_edge"] = 128
-    model = AutoModelForImageTextToText.from_pretrained(
-        str(model_dir), dtype=torch.bfloat16, attn_implementation="sdpa",
-        device_map={"": "cuda:0"}, trust_remote_code=True, local_files_only=True)
-    model.eval()
-    model.config.use_cache = False
-    text_config = getattr(model.config, "text_config", model.config)
-    text_config.use_cache = False
-    n_layers = len(model.model.language_model.layers)
-    gt_module.validate_head_layout(model)
-    print(f"  [model] rank-local SDPA 完整模型：cuda:0，{n_layers} layers")
-    return model, processor, n_layers
 
 
 def _merge_gt_rank_jsons(rank_root: Path, output_dir: Path, world_size: int,
@@ -2037,6 +1115,7 @@ def _merge_gt_rank_jsons(rank_root: Path, output_dir: Path, world_size: int,
         "distributed": True, "world_size": world_size, "n_gpus": world_size,
         "n_valid": total_valid,
         "n_failures": sum(int(r["_meta"].get("n_failures", 0)) for r in rank_results),
+        "n_duration_skipped": sum(int(r["_meta"].get("n_duration_skipped", 0)) for r in rank_results),
         "per_rank_n_valid": [int(r["_meta"]["n_valid"]) for r in rank_results],
         "gradient_attribution": False, "combined_selection": False,
         "extra_frame_cap": False,
@@ -2057,77 +1136,49 @@ def _merge_gt_rank_jsons(rank_root: Path, output_dir: Path, world_size: int,
 
 
 def gt_distributed_main(argv=None):
-    argv = list(sys.argv[1:] if argv is None else argv)
-    args = _gt_distributed_parser().parse_args(argv)
+    args = build_parser().parse_args(argv)
     local_rank = int(os.environ.get("LOCAL_RANK", "0"))
     rank = int(os.environ.get("RANK", "0"))
     world_size = int(os.environ.get("WORLD_SIZE", "1"))
-
+    # Preserve the existing one-visible-GPU-per-rank mapping before CUDA init.
     if world_size > 1:
         visible = os.environ.get("CUDA_VISIBLE_DEVICES")
         if visible:
-            devices = [value.strip() for value in visible.split(",") if value.strip()]
+            devices = [v.strip() for v in visible.split(",") if v.strip()]
             os.environ["CUDA_VISIBLE_DEVICES"] = devices[local_rank]
         else:
             os.environ["CUDA_VISIBLE_DEVICES"] = str(local_rank)
 
     import torch
     import torch.distributed as dist
-    import new_d_head_attribution as gt_module
 
     if not torch.cuda.is_available():
-        raise RuntimeError("多卡 GT head 探测要求 CUDA")
+        raise RuntimeError("Multi-GPU GT probing requires CUDA")
     torch.cuda.set_device(0)
     if world_size > 1:
         dist.init_process_group(backend="gloo", init_method="env://")
-
-    output_dir = Path(args.output_dir).expanduser().resolve()
-    rank_root = output_dir / "_rank_outputs"
-    rank_dir = rank_root / f"rank_{rank}"
-    rank_dir.mkdir(parents=True, exist_ok=True)
-    original_load_samples = gt_module.load_samples
-
-    def rank_samples(filtered_json, video_dir, max_samples):
-        all_samples = original_load_samples(filtered_json, video_dir, max_samples)
-        local = all_samples[rank::world_size]
-        print(f"[distributed] rank={rank}/{world_size}：全局={len(all_samples)}，本 rank={len(local)}")
-        return local
-
-    gt_module.load_samples = rank_samples
-    gt_module.load_model_and_processor = lambda model_dir, **kwargs: (
-        _gt_rank_model_loader(gt_module, model_dir, **kwargs))
-    # 多卡版按用户要求不设置额外帧数上限；仍按 2 FPS 采样并由 token budget 编码。
-    gt_module.resolve_max_frames = lambda max_frames, total_tokens, min_tokens: 0
-    rank_argv = [
-        "--filtered-json", args.filtered_json,
-        "--model-path", args.model_path,
-        "--video-dir", args.video_dir,
-        "--output-dir", str(rank_dir),
-        "--max-samples", str(args.max_samples),
-        "--max-valid-samples", str(args.max_valid_samples),
-        "--max-duration", str(args.max_duration),
-        "--fps", str(args.fps), "--max-frames", "0",
-        "--min-tokens", str(args.min_tokens),
-        "--total-tokens", str(args.total_tokens),
-        "--top-k", str(args.top_k),
-        "--min-gt-ratio", str(args.min_gt_ratio),
-        "--score-eps", str(args.score_eps),
-    ]
-    if args.timelens_model:
-        rank_argv.append("--timelens-model")
-    rc = gt_module.gt_only_main(rank_argv)
-    if rc != 0:
-        raise RuntimeError(f"rank {rank} GT 探测失败：{rc}")
-    if world_size > 1:
-        dist.barrier()
-    if rank == 0:
-        _merge_gt_rank_jsons(rank_root, output_dir, world_size,
-                             args.top_k, args.min_gt_ratio)
-        import shutil
-        shutil.rmtree(rank_root)
-    if world_size > 1:
-        dist.barrier()
-        dist.destroy_process_group()
+    try:
+        output_dir = Path(args.output_dir).expanduser().resolve()
+        rank_root = output_dir / "_rank_outputs"
+        rank_dir = rank_root / f"rank_{rank}"
+        rank_dir.mkdir(parents=True, exist_ok=True)
+        rank_args = argparse.Namespace(**vars(args))
+        rank_args.output_dir = str(rank_dir)
+        rc = _run_rank_gt(rank_args, rank, world_size)
+        if rc != 0:
+            raise RuntimeError(f"rank {rank} GT probe failed: {rc}")
+        if world_size > 1:
+            dist.barrier()
+        if rank == 0:
+            _merge_gt_rank_jsons(rank_root, output_dir, world_size,
+                                args.top_k, args.min_gt_ratio)
+            import shutil
+            shutil.rmtree(rank_root)
+        if world_size > 1:
+            dist.barrier()
+    finally:
+        if world_size > 1:
+            dist.destroy_process_group()
     return 0
 
 
