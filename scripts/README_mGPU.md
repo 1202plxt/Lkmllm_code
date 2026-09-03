@@ -1,5 +1,9 @@
 # TimeLens 多卡 GT-only 探测、微调与评测
 
+
+模型下载：hf download TencentARC/TimeLens-8B \
+    --local-dir ../shared_models/TimeLens-8B
+    
 本文档对应三个脚本：
 
 - `scripts/m_d_startend_gradient_head_attribution.py`：TimeLens-8B 纯 GT 对齐分数探测（直接复制 new 方法的独立实现，不 import new 脚本，不再使用梯度归因）。
