@@ -76,7 +76,7 @@ CUDA_VISIBLE_DEVICES=0,1,2,3,4,5,6,7 torchrun --standalone --nproc_per_node 8 sc
     --anno-json ../Lkmllm_data/datasets/Train/timelens-100k/timelens-100k.jsonl \
     --video-dir ../Lkmllm_data/datasets/Train/timelens-100k \
     --output-dir ../Lkmllm_data/checkpoints/layer12_19_qvo_lora_r8_5k_ep3_align002_lr5e5_mGPU \
-    --target-layers 12-19 \
+    --target-layers 16-23 \
     --adapt-targets q_proj v_proj o_proj \
     --lora-rank 8 \
     --lora-alpha 16 \
@@ -87,7 +87,7 @@ CUDA_VISIBLE_DEVICES=0,1,2,3,4,5,6,7 torchrun --standalone --nproc_per_node 8 sc
     --max-samples-per-folder 0 \
     --max-samples 5000 \
     --epochs 3 \
-    --lr 5e-5 \
+    --lr 3e-5 \
     --gradient-accumulation-steps 8 \
     --grad-clip 1.0 \
     --fps 2 \
