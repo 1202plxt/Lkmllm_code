@@ -17,25 +17,6 @@ m_e_head_eval.py — TimeLens Temporal Grounding 多卡评测
 其中 --max-frames 0 表示不在脚本中额外限制帧数，只由 FPS 和 token budget
 控制视频输入。若训练时显式修改了上述任意参数，评测时也必须传入相同值。
 
-八卡评测微调模型：
-
-  CUDA_VISIBLE_DEVICES=0,1,2,3,4,5,6,7 python scripts/e_head_eval.py \
-    --model-path ../Lkmllm_data/checkpoints/layer12_19_qvo_lora_r8_align001_mGPU \
-    --anno-json ../Lkmllm_data/datasets/Test/Charades_sta/charades-timelens.json \
-    --video-dir ../Lkmllm_data/datasets/Test/Charades_sta/charades \
-    --output-dir ../Lkmllm_data/outputs/eval_results \
-    --split Charades_layer12_19_qvo_r8_align001_mGPU \
-    --num-gpus 1
-
-八卡评测 Qwen3-VL-8B base：
-
-  CUDA_VISIBLE_DEVICES=0,1,2,3,4,5,6,7 python scripts/m_e_head_eval.py \
-    --model-path ../shared_models/Qwen3-VL-8B-Instruct \
-    --anno-json ../Lkmllm_data/datasets/Test/Charades_sta/charades-timelens.json \
-    --video-dir ../Lkmllm_data/datasets/Test/Charades_sta/charades \
-    --output-dir ../Lkmllm_data/outputs/eval_results \
-    --split Charades_Qwen3VL8B_base_mGPU \
-    --num-gpus 8
 
 说明：
   - --num-gpus 0：自动使用全部可见 GPU。
@@ -953,6 +934,8 @@ def _worker_entry(gpu_id: int, model_dir: Path, samples: list, video_dir: Path,
 
 def main(argv=None):
     args = build_parser().parse_args(argv)
+    if args.max_frames != 0:
+        raise ValueError("多卡评测不再设置额外帧数上限，请使用 --max-frames 0")
     # All model types share the TimeLens full-evaluation defaults in this
     # multi-GPU entry. The flag changes prompt/processor/generation only.
     out_dir = ensure_directory(Path(args.output_dir))
