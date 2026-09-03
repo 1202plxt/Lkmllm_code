@@ -2,7 +2,7 @@
 
 本文档对应三个脚本：
 
-- `scripts/m_d_startend_gradient_head_attribution.py`：纯 GT 对齐分数探测（文件名保留历史命名，不再使用梯度归因）。
+- `scripts/m_d_startend_gradient_head_attribution.py`：TimeLens-8B 纯 GT 对齐分数探测（直接复制 new 方法的独立实现，不 import new 脚本，不再使用梯度归因）。
 - `scripts/m_heads_finetune_layer_lora_attn_align.py`：使用 GT-only JSON 选择 alignment head 的多卡微调。
 - `scripts/m_e_head_eval.py`：对微调后的完整模型或基线模型生成预测，评测 IoU / Recall。
 
@@ -38,14 +38,17 @@
 
 ## 2. 八卡纯 GT 对齐 Head 探测
 
+探测模型使用 `../shared_models/TimeLens-8B`。脚本默认启用 TimeLens prompt 和 processor 设置（`padding_side="left"`、`do_resize=False`），不强制覆盖处理器的视觉缩放尺寸。微调起点仍沿用第 3 节的 Qwen3-VL-8B-Instruct，本次只切换探测模型。
+
 只计算时间戳 query 的 GT attention mass，经视频 attention mass 和均匀基线归一化得到 GT 对齐分数。不做 backward，不使用梯度归因、联合筛选或层间归一化联合排名。主模型使用 SDPA，hook 单独计算时间戳 query 对应的 attention 行。
 
 ```bash
 CUDA_VISIBLE_DEVICES=0,1,2,3,4,5,6,7 torchrun --standalone --nproc_per_node 8 scripts/m_d_startend_gradient_head_attribution.py \
     --filtered-json ../Lkmllm_data/datasets/Train/timelens-100k/timelens-100k.jsonl \
-    --model-path ../shared_models/Qwen3-VL-8B-Instruct \
+    --model-path ../shared_models/TimeLens-8B \
+    --timelens-model \
     --video-dir ../Lkmllm_data/datasets/Train/timelens-100k \
-    --output-dir ../Lkmllm_data/outputs/m_head_attr_gt_only_500 \
+    --output-dir ../Lkmllm_data/outputs/m_timelens_head_attr_gt_only_500 \
     --max-samples 500 \
     --max-duration 0 \
     --top-k 30 \
@@ -57,7 +60,7 @@ CUDA_VISIBLE_DEVICES=0,1,2,3,4,5,6,7 torchrun --standalone --nproc_per_node 8 sc
 每个 rank 处理候选集合的 `rank::world_size` 切片。Rank 0 按有效样本数加权合并后，只保留最终文件：
 
 ```text
-../Lkmllm_data/outputs/m_head_attr_gt_only_500/video_only_head_attribution.json
+../Lkmllm_data/outputs/m_timelens_head_attr_gt_only_500/video_only_head_attribution.json
 ```
 
 文件包含 `video_only_top_heads`、`gt_alignment_score_matrix` 和有效样本计数。微调只需这一个 JSON。临时 rank 结果在合并成功后清理。
@@ -68,7 +71,7 @@ CUDA_VISIBLE_DEVICES=0,1,2,3,4,5,6,7 torchrun --standalone --nproc_per_node 8 sc
 
 ```bash
 CUDA_VISIBLE_DEVICES=0,1,2,3,4,5,6,7 torchrun --standalone --nproc_per_node 8 scripts/m_heads_finetune_layer_lora_attn_align.py \
-    --attr-json ../Lkmllm_data/outputs/m_head_attr_gt_only_500/video_only_head_attribution.json \
+    --attr-json ../Lkmllm_data/outputs/m_timelens_head_attr_gt_only_500/video_only_head_attribution.json \
     --model-path ../shared_models/Qwen3-VL-8B-Instruct \
     --anno-json ../Lkmllm_data/datasets/Train/timelens-100k/timelens-100k.jsonl \
     --video-dir ../Lkmllm_data/datasets/Train/timelens-100k \
