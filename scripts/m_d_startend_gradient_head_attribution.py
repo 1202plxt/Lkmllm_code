@@ -13,19 +13,18 @@ token budget 交由 Qwen 视频处理器分配。
 
 八卡运行：
 
-  torchrun --standalone --nproc_per_node 8 \
-    scripts/m_d_startend_gradient_head_attribution.py \
+  CUDA_VISIBLE_DEVICES=0 torchrun --standalone --nproc_per_node 1 scripts/m_d_startend_gradient_head_attribution.py \
     --filtered-json ../Lkmllm_data/datasets/Train/timelens-100k/timelens-100k.jsonl \
-    --model-path ../shared_models/Qwen3-VL-8B-Instruct \
+    --model-path ../shared_models/TimeLens-8B \
+    --timelens-model \
     --video-dir ../Lkmllm_data/datasets/Train/timelens-100k \
-    --output-dir ../Lkmllm_data/outputs/startend_gradient_head_attr_mGPU \
-    --max-samples 500 \
+    --output-dir ../Lkmllm_data/outputs/m_timelens_head_attr_gt_only_500 \
+    --max-samples 2000 \
     --max-duration 0 \
     --top-k 30 \
     --fps 2 \
     --min-tokens 64 \
-    --total-tokens 14336 \
-    --top-k 30
+    --total-tokens 14336
 
 最终结果：
   <output-dir>/video_only_head_attribution.json
