@@ -18,7 +18,7 @@
 | 探测候选样本 | 全部 GPU 合计 500 |
 | 微调样本 | 全部 GPU 合计最多 5000 |
 | epochs | 3 |
-| learning rate | 5e-5 |
+| learning rate | 3e-5 |
 | alignment weight | 0.02 |
 | alignment top heads | 10 |
 | target layers | 12-19 |
