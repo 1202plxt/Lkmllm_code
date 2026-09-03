@@ -3,7 +3,7 @@
 本文档对应三个脚本：
 
 - `scripts/m_d_startend_gradient_head_attribution.py`：TimeLens-8B 纯 GT 对齐分数探测（直接复制 new 方法的独立实现，不 import new 脚本，不再使用梯度归因）。
-- `scripts/m_heads_finetune_layer_lora_attn_align.py`：使用 GT-only JSON 选择 alignment head 的多卡微调。
+- `scripts/m_heads_finetune_layer_lora_attn_align.py`：TimeLens 时间戳 CE-only 多卡 LoRA 微调。
 - `scripts/m_e_head_eval.py`：对微调后的完整模型或基线模型生成预测，评测 IoU / Recall。
 
 三个阶段均保持每张 GPU 加载一份完整模型、分摊不同样本，不跨 GPU 分片。微调同步梯度；探测和评测汇总各卡结果。评测不再读取 head JSON，也不以 GT 分数替代定位指标。
@@ -19,9 +19,7 @@
 | 微调样本 | 全部 GPU 合计最多 5000 |
 | epochs | 3 |
 | learning rate | 5e-5 |
-| alignment weight | 0.02 |
-| alignment top heads | 10 |
-| target layers | 16-23 |
+| target layers | 12-19 |
 | LoRA targets | q_proj、v_proj、o_proj |
 | LoRA rank / alpha / dropout | 8 / 16 / 0.02 |
 | gradient accumulation / clip | 8 / 1.0 |
@@ -32,7 +30,7 @@
 
 必须设置 `--max-samples-per-folder 0`，才能让 `--max-samples 5000` 生效。5000 不是每卡样本数；加载满 5000 条时每卡每轮为 625 条。有效全局 batch 为 `8 × 1 × 8 = 64`（完整累积窗口）。
 
-总损失为 `CE_loss + 0.02 × alignment_loss`。保留此前的层级 LoRA 配置：12–19 层全部 head 的 q/v/o 投影参与适配，alignment head 从 GT-only JSON 中筛选且限定在这些层内；不是只训练全模型 GT Top-K head。
+当前只优化时间戳数字 token 的 CE。保留此前的层级 LoRA 配置：12–19 层全部 head 的 q/v/o 投影参与适配；固定层模式不使用 GT 排名。若需要按 GT Top-K head 选择 LoRA 范围，使用 `--target-layers "" --top-k 20`。
 
 所有命令均在服务器的 `Lkmllm_code` 目录下运行。续行缩进四个空格，反斜杠必须是行末最后一个字符。
 
@@ -76,19 +74,16 @@ CUDA_VISIBLE_DEVICES=0,1,2,3,4,5,6,7 torchrun --standalone --nproc_per_node 8 sc
     --timelens-model \
     --anno-json ../Lkmllm_data/datasets/Train/timelens-100k/timelens-100k.jsonl \
     --video-dir ../Lkmllm_data/datasets/Train/timelens-100k \
-    --output-dir ../Lkmllm_data/checkpoints/TimeLens8B_layer12_19_qvo_lora_r8_5k_ep3_align002_lr5e5_mGPU \
-    --target-layers 16-23 \
+    --output-dir ../Lkmllm_data/checkpoints/TimeLens8B_layer12_19_qvo_lora_r8_5k_ep3_CEonly_lr5e5_mGPU \
+    --target-layers 12-19 \
     --adapt-targets q_proj v_proj o_proj \
     --lora-rank 8 \
     --lora-alpha 16 \
     --lora-dropout 0.02 \
-    --align-top-n 10 \
-    --align-weight 0.00 \
-    --align-temperature 1.0 \
     --max-samples-per-folder 0 \
     --max-samples 5000 \
-    --epochs 2 \
-    --lr 1e-5 \
+    --epochs 3 \
+    --lr 5e-5 \
     --warmup-ratio 0.1 \
     --gradient-accumulation-steps 8 \
     --grad-clip 1.0 \
@@ -104,7 +99,7 @@ CUDA_VISIBLE_DEVICES=0,1,2,3,4,5,6,7 torchrun --standalone --nproc_per_node 8 sc
 训练和下文微调评测统一使用带 `TimeLens8B` 前缀的新目录，避免与旧 Qwen3 base 微调结果混淆：
 
 ```text
-../Lkmllm_data/checkpoints/TimeLens8B_layer12_19_qvo_lora_r8_5k_ep3_align002_lr5e5_mGPU/
+../Lkmllm_data/checkpoints/TimeLens8B_layer12_19_qvo_lora_r8_5k_ep3_CEonly_lr5e5_mGPU/
 ├── lora_layer_checkpoint.pt   # 最新训练断点；完成后保留
 ├── lora_epoch_001.pt          # 第 1 轮轻量 checkpoint
 ├── lora_epoch_002.pt          # 第 2 轮轻量 checkpoint
@@ -124,7 +119,7 @@ CUDA_VISIBLE_DEVICES=0,1,2,3,4,5,6,7 torchrun --standalone --nproc_per_node 8 sc
 
 代码原本已有约 10% 的线性 warmup，现在开放 `--warmup-ratio 0.1`，也可用 `--warmup-steps N` 指定优化器更新步数（优先于比例，0 为禁用）。Warmup 后线性降低学习率。5000 样本、8 卡、3 轮、梯度累积 8 的计划为 237 次更新、24 次 warmup 更新；实际跳过样本会影响更新数。修改 warmup 后若想从头比较，应使用新的输出目录，不要自动恢复旧断点。进度条 loss 是 epoch 内累计均值，`lr` 显示当前学习率。
 
-`--align-weight 0` 会关闭 alignment hook，只使用现有的时间戳数字 token CE，不是对全部答案文本做 CE。LoRA 层/head 选择不变，仍需传原 GT JSON。
+alignment loss 和相关 hook 已从多卡脚本删除，不再接受 `--align-weight`、`--align-top-n`、`--align-temperature`。当前只监督时间戳数字 token 的 CE。CE-only 对照请使用新的输出目录，不要自动恢复旧 alignment 实验断点。
 
 每轮只保存 LoRA 参数、mask、优化器和调度器状态，以及原始模型路径/LoRA 配置，不包含完整基础模型。默认仅在全部训练结束时合并一次完整模型；添加 `--skip-final-merge` 可完全跳过自动合并，只保留轻量文件。
 
@@ -132,7 +127,7 @@ CUDA_VISIBLE_DEVICES=0,1,2,3,4,5,6,7 torchrun --standalone --nproc_per_node 8 sc
 
 ```bash
 CUDA_VISIBLE_DEVICES=0 python scripts/merge_m_head_lora.py \
-    --checkpoint ../Lkmllm_data/checkpoints/TimeLens8B_layer12_19_qvo_lora_r8_5k_ep3_align002_lr5e5_mGPU/lora_epoch_002.pt \
+    --checkpoint ../Lkmllm_data/checkpoints/TimeLens8B_layer12_19_qvo_lora_r8_5k_ep3_CEonly_lr5e5_mGPU/lora_epoch_002.pt \
     --model-path ../shared_models/TimeLens-8B \
     --output-dir ../shared_models/TimeLens8B_gt_lora_epoch002 \
     --device cuda:0
@@ -148,18 +143,18 @@ CUDA_VISIBLE_DEVICES=0 python scripts/merge_m_head_lora.py \
 
 所有命令显式评完整测试集（`--max-samples 0`），并使用相同的视频输入参数。微调、base 和 TimeLens 分开保存结果，且每个 `--split` 同时标记数据集和模型，避免覆盖或混淆。若要复现历史 500 样本实验，请将对比各组都改成 `--max-samples 500` 并使用独立输出目录。
 
-### 5.1 TimeLens-8B：GT-only head 筛选后的微调模型
+### 5.1 TimeLens-8B：CE-only LoRA 微调模型
 
 #### Charades-STA-TimeLens
 
 ```bash
 CUDA_VISIBLE_DEVICES=0,1,2,3,4,5,6,7 python scripts/m_e_head_eval.py \
-    --model-path ../Lkmllm_data/checkpoints/TimeLens8B_layer12_19_qvo_lora_r8_5k_ep3_align002_lr5e5_mGPU \
+    --model-path ../Lkmllm_data/checkpoints/TimeLens8B_layer12_19_qvo_lora_r8_5k_ep3_CEonly_lr5e5_mGPU \
     --timelens-model \
     --anno-json ../Lkmllm_data/datasets/Test/Charades_sta/charades-timelens.json \
     --video-dir ../Lkmllm_data/datasets/Test/Charades_sta/charades \
-    --output-dir ../Lkmllm_data/outputs/eval_results/TimeLens8B_layer12_19_qvo_lora_r8_5k_ep3_align002_lr5e5_mGPU \
-    --split Charades_TimeLens8B_layer12_19_qvo_lora_r8_5k_ep3_align002_lr5e5_mGPU \
+    --output-dir ../Lkmllm_data/outputs/eval_results/TimeLens8B_layer12_19_qvo_lora_r8_5k_ep3_CEonly_lr5e5_mGPU \
+    --split Charades_TimeLens8B_layer12_19_qvo_lora_r8_5k_ep3_CEonly_lr5e5_mGPU \
     --num-gpus 8 \
     --max-samples 0 \
     --fps 2 \
@@ -173,12 +168,12 @@ CUDA_VISIBLE_DEVICES=0,1,2,3,4,5,6,7 python scripts/m_e_head_eval.py \
 
 ```bash
 CUDA_VISIBLE_DEVICES=0,1,2,3,4,5,6,7 python scripts/m_e_head_eval.py \
-    --model-path ../Lkmllm_data/checkpoints/TimeLens8B_layer12_19_qvo_lora_r8_5k_ep3_align002_lr5e5_mGPU \
+    --model-path ../Lkmllm_data/checkpoints/TimeLens8B_layer12_19_qvo_lora_r8_5k_ep3_CEonly_lr5e5_mGPU \
     --timelens-model \
     --anno-json ../Lkmllm_data/datasets/Test/Activitynet/activitynet-timelens.json \
     --video-dir ../Lkmllm_data/datasets/Test/Activitynet/activitynet \
-    --output-dir ../Lkmllm_data/outputs/eval_results/TimeLens8B_layer12_19_qvo_lora_r8_5k_ep3_align002_lr5e5_mGPU \
-    --split ActivityNet_TimeLens8B_layer12_19_qvo_lora_r8_5k_ep3_align002_lr5e5_mGPU \
+    --output-dir ../Lkmllm_data/outputs/eval_results/TimeLens8B_layer12_19_qvo_lora_r8_5k_ep3_CEonly_lr5e5_mGPU \
+    --split ActivityNet_TimeLens8B_layer12_19_qvo_lora_r8_5k_ep3_CEonly_lr5e5_mGPU \
     --num-gpus 8 \
     --max-samples 0 \
     --fps 2 \
@@ -192,12 +187,12 @@ CUDA_VISIBLE_DEVICES=0,1,2,3,4,5,6,7 python scripts/m_e_head_eval.py \
 
 ```bash
 CUDA_VISIBLE_DEVICES=0,1,2,3,4,5,6,7 python scripts/m_e_head_eval.py \
-    --model-path ../Lkmllm_data/checkpoints/TimeLens8B_layer12_19_qvo_lora_r8_5k_ep3_align002_lr5e5_mGPU \
+    --model-path ../Lkmllm_data/checkpoints/TimeLens8B_layer12_19_qvo_lora_r8_5k_ep3_CEonly_lr5e5_mGPU \
     --timelens-model \
     --anno-json ../Lkmllm_data/datasets/Test/Qvhighlights/qvhighlights-timelens.json \
     --video-dir ../Lkmllm_data/datasets/Test/Qvhighlights/qvhighlights \
-    --output-dir ../Lkmllm_data/outputs/eval_results/TimeLens8B_layer12_19_qvo_lora_r8_5k_ep3_align002_lr5e5_mGPU \
-    --split QVHighlights_TimeLens8B_layer12_19_qvo_lora_r8_5k_ep3_align002_lr5e5_mGPU \
+    --output-dir ../Lkmllm_data/outputs/eval_results/TimeLens8B_layer12_19_qvo_lora_r8_5k_ep3_CEonly_lr5e5_mGPU \
+    --split QVHighlights_TimeLens8B_layer12_19_qvo_lora_r8_5k_ep3_CEonly_lr5e5_mGPU \
     --num-gpus 8 \
     --max-samples 0 \
     --fps 2 \
