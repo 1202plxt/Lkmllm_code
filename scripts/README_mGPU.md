@@ -111,7 +111,7 @@ CUDA_VISIBLE_DEVICES=0,1,2,3,4,5,6,7 torchrun --standalone --nproc_per_node 8 sc
 └── processor/tokenizer files
 ```
 
-目录标签 `lr5e5` 对应命令中的 `--lr 5e-5`。这里更新的是命令中的输出路径，不会重命名磁盘上已有权重。不要用旧的 `align001` 目录恢复这次新实验；如需恢复本次实验，使用原参数和本次输出目录重启。
+目录标签 `lr3e5` 对应命令中的 `--lr 3e-5`。这里更新的是命令中的输出路径，不会重命名磁盘上已有权重。不要用旧的 `align001` 目录恢复这次新实验；如需恢复本次实验，使用原参数和本次输出目录重启。
 
 正常完成后，评测的 `--model-path` 指向整个保存目录，不是单独的 adapter 或某个 safetensors 分片。
 
