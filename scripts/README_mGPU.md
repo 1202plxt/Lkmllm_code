@@ -49,7 +49,7 @@ CUDA_VISIBLE_DEVICES=0,1,2,3,4,5,6,7 torchrun --standalone --nproc_per_node 8 sc
     --timelens-model \
     --video-dir ../Lkmllm_data/datasets/Train/timelens-100k \
     --output-dir ../Lkmllm_data/outputs/m_timelens_head_attr_gt_only_500 \
-    --max-samples 500 \
+    --max-samples 2000 \
     --max-duration 0 \
     --top-k 30 \
     --fps 2 \
