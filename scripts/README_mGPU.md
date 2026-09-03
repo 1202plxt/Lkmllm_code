@@ -133,7 +133,7 @@ CUDA_VISIBLE_DEVICES=0,1,2,3,4,5,6,7 python scripts/m_e_head_eval.py \
     --anno-json ../Lkmllm_data/datasets/Test/Charades_sta/charades-timelens.json \
     --video-dir ../Lkmllm_data/datasets/Test/Charades_sta/charades \
     --output-dir ../Lkmllm_data/outputs/eval_results/layer12_19_qvo_lora_r8_5k_ep3_align002_lr5e5_mGPU \
-    --split Charades_layer12_19_qvo_lora_r8_5k_ep3_align002_lr5e5_mGPU \
+    --split Charades_mGPU \
     --num-gpus 8 \
     --max-samples 0 \
     --fps 2 \
@@ -151,7 +151,7 @@ CUDA_VISIBLE_DEVICES=0,1,2,3,4,5,6,7 python scripts/m_e_head_eval.py \
     --anno-json ../Lkmllm_data/datasets/Test/Activitynet/activitynet-timelens.json \
     --video-dir ../Lkmllm_data/datasets/Test/Activitynet/activitynet \
     --output-dir ../Lkmllm_data/outputs/eval_results/layer12_19_qvo_lora_r8_5k_ep3_align002_lr5e5_mGPU \
-    --split ActivityNet_layer12_19_qvo_lora_r8_5k_ep3_align002_lr5e5_mGPU \
+    --split ActivityNet_mGPU \
     --num-gpus 8 \
     --max-samples 0 \
     --fps 2 \
@@ -169,7 +169,7 @@ CUDA_VISIBLE_DEVICES=0,1,2,3,4,5,6,7 python scripts/m_e_head_eval.py \
     --anno-json ../Lkmllm_data/datasets/Test/Qvhighlights/qvhighlights-timelens.json \
     --video-dir ../Lkmllm_data/datasets/Test/Qvhighlights/qvhighlights \
     --output-dir ../Lkmllm_data/outputs/eval_results/layer12_19_qvo_lora_r8_5k_ep3_align002_lr5e5_mGPU \
-    --split QVHighlights_layer12_19_qvo_lora_r8_5k_ep3_align002_lr5e5_mGPU \
+    --split QVHighlights_mGPU \
     --num-gpus 8 \
     --max-samples 0 \
     --fps 2 \
