@@ -21,7 +21,7 @@
 | learning rate | 3e-5 |
 | alignment weight | 0.02 |
 | alignment top heads | 10 |
-| target layers | 12-19 |
+| target layers | 16-23 |
 | LoRA targets | q_proj、v_proj、o_proj |
 | LoRA rank / alpha / dropout | 8 / 16 / 0.02 |
 | gradient accumulation / clip | 8 / 1.0 |
