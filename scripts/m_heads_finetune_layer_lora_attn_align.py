@@ -93,6 +93,11 @@ TIMELENS_USER_TEMPLATE = (
     "'The event happens in <start time> - <end time> seconds'."
 )
 TIMELENS_ASSISTANT_TEMPLATE = "The event happens in {start} - {end} seconds."
+TIMELENS_OFFICIAL_USER_TEMPLATE = (
+    "Please find the visual event described by the sentence '{query}', determining its "
+    "starting and ending times. The format should be: 'The event happens in "
+    "<start time> - <end time> seconds'."
+)
 
 # ═══════════════ 工具函数 ═══════════════
 
@@ -145,7 +150,8 @@ def _build_numeric_mask(assist_ids, gt_start, gt_end, tokenizer):
 # ═══════════════ 模型加载 ═══════════════
 
 def load_model_with_attn(model_path: Path, attn_implementation: str = "flash_attention_2",
-                         device: Optional[torch.device] = None):
+                         device: Optional[torch.device] = None,
+                         timelens_model: bool = False):
     if attn_implementation == "flash_attention_2":
         try:
             import flash_attn
@@ -153,10 +159,15 @@ def load_model_with_attn(model_path: Path, attn_implementation: str = "flash_att
         except ImportError:
             print("  [attn] flash_attn 不可用，降级为 sdpa")
             attn_implementation = "sdpa"
-    if device is not None:
+    if device is not None or timelens_model:
         from transformers import AutoModelForImageTextToText, AutoProcessor
+        processor_kwargs = dict(trust_remote_code=True, local_files_only=True)
+        if timelens_model:
+            processor_kwargs.update(padding_side="left", do_resize=False)
         processor = AutoProcessor.from_pretrained(
-            str(model_path), trust_remote_code=True, local_files_only=True)
+            str(model_path), **processor_kwargs)
+        if device is None:
+            device = torch.device("cuda:0")
         model = AutoModelForImageTextToText.from_pretrained(
             str(model_path),
             dtype=torch.bfloat16,
@@ -186,6 +197,8 @@ def build_parser() -> argparse.ArgumentParser:
         description="TimeLens-aligned head/layer-masked LoRA + Attention Alignment (含 RoPE) 微调")
     p.add_argument("--attr-json", required=True)
     p.add_argument("--model-path", required=True)
+    p.add_argument("--timelens-model", action="store_true",
+                   help="Fine-tune TimeLens-8B with its official user prompt and processor settings")
     p.add_argument("--anno-json", required=True)
     p.add_argument("--video-dir", required=True)
     p.add_argument("--output-dir", required=True)
@@ -239,19 +252,16 @@ def load_head_targets(attr_json, top_k, align_top_n, n_layers, n_heads,
         scores = {lh: 0.0 for lh in selected}
     else:
         data = json.loads(Path(attr_json).read_text(encoding="utf-8"))
-        top_raw = data.get("top_k_heads", [])
-        if not top_raw and "combined_score_matrix" in data:
-            arr = np.array(data["combined_score_matrix"], dtype=np.float32)
-            for fi in np.argsort(arr.ravel())[::-1][:top_k]:
-                l, h = divmod(int(fi), arr.shape[1])
-                top_raw.append({"layer": l, "head": h,
-                                "combined_score": float(arr.ravel()[fi])})
+        top_raw = data.get("video_only_top_heads", [])
+        if not top_raw:
+            raise ValueError(f"{attr_json} 中没有 video_only_top_heads")
         selected, scores = [], {}
         for e in top_raw[:top_k]:
             l, h = int(e.get("layer", 0)), int(e.get("head", 0))
             selected.append((l, h))
-            scores[(l, h)] = float(e.get("combined_score", 0))
-        print(f"  [attr] Top-{len(selected)} heads:")
+            scores[(l, h)] = float(e.get(
+                "gt_alignment_score", e.get("video_gt_ratio", 0)))
+        print(f"  [attr] GT alignment Top-{len(selected)} heads:")
         for i, (l, h) in enumerate(selected):
             print(f"    #{i+1}: L{l}H{h} score={scores.get((l,h),0):.6f}")
 
@@ -310,13 +320,9 @@ def load_align_heads_from_attr(attr_json, align_top_n, allowed_layers=None):
     if align_top_n <= 0:
         return []
     data = json.loads(Path(attr_json).read_text(encoding="utf-8"))
-    top_raw = data.get("top_k_heads", [])
-    if not top_raw and "combined_score_matrix" in data:
-        arr = np.array(data["combined_score_matrix"], dtype=np.float32)
-        for fi in np.argsort(arr.ravel())[::-1]:
-            l, h = divmod(int(fi), arr.shape[1])
-            top_raw.append({"layer": l, "head": h,
-                            "combined_score": float(arr.ravel()[fi])})
+    top_raw = data.get("video_only_top_heads", [])
+    if not top_raw:
+        raise ValueError(f"{attr_json} 中没有 video_only_top_heads")
     allowed = set(allowed_layers) if allowed_layers is not None else None
     align_heads = []
     for e in top_raw:
@@ -326,7 +332,7 @@ def load_align_heads_from_attr(attr_json, align_top_n, allowed_layers=None):
         align_heads.append((l, h))
         if len(align_heads) >= align_top_n:
             break
-    print(f"  [align] Attr top heads for alignment: "
+    print(f"  [align] GT-only top heads for alignment: "
           f"{['L'+str(l)+'H'+str(h) for l, h in align_heads]}")
     return align_heads
 
@@ -910,7 +916,7 @@ class VideoDataset(Dataset):
                 "min_tokens": self.min_tokens, "total_tokens": self.total_tokens}
 
 
-def collate_fn_with_processor(batch, processor, device):
+def collate_fn_with_processor(batch, processor, device, timelens_model=False):
     from qwen_vl_utils import process_vision_info
     item = batch[0]
     if not item["frames"]:
@@ -924,17 +930,20 @@ def collate_fn_with_processor(batch, processor, device):
         video_content["min_pixels"] = item["min_tokens"] * PATCH_PIXELS
         video_content["total_pixels"] = item["total_tokens"] * PATCH_PIXELS
 
+    user_template = TIMELENS_OFFICIAL_USER_TEMPLATE if timelens_model else TIMELENS_USER_TEMPLATE
     messages = [
-        {"role": "system", "content": [{"type": "text", "text": TIMELENS_SYSTEM}]},
         {"role": "user", "content": [
             video_content,
-            {"type": "text", "text": TIMELENS_USER_TEMPLATE.format(query=item["query"])},
+            {"type": "text", "text": user_template.format(query=item["query"])},
         ]},
         {"role": "assistant", "content": [
             {"type": "text", "text": TIMELENS_ASSISTANT_TEMPLATE.format(
                 start=item["gt_start"], end=item["gt_end"])},
         ]},
     ]
+    if not timelens_model:
+        messages.insert(0, {"role": "system", "content": [
+            {"type": "text", "text": TIMELENS_SYSTEM}]})
     full_text = processor.apply_chat_template(messages, tokenize=False)
     imgs, vids, vkw = process_vision_info(
         messages,
@@ -1298,6 +1307,8 @@ def train(model, processor, dataloader, device, target_heads, target_layers,
 
 def main(argv=None):
     args = build_parser().parse_args(argv)
+    if args.max_frames != 0:
+        raise ValueError("多卡微调不再设置额外帧数上限，请使用 --max-frames 0")
     distributed, local_rank, world_size = setup_distributed()
     ensure_directory(Path(args.output_dir))
     seed_everything(args.sample_seed + local_rank)
@@ -1309,7 +1320,8 @@ def main(argv=None):
         print("Loading model...")
     load_device = torch.device(f"cuda:{local_rank}") if distributed else None
     model, processor = load_model_with_attn(
-        Path(args.model_path), args.attn_implementation, device=load_device)
+        Path(args.model_path), args.attn_implementation, device=load_device,
+        timelens_model=args.timelens_model)
     if hasattr(model, "gradient_checkpointing_enable"):
         try:
             model.gradient_checkpointing_enable(
@@ -1351,7 +1363,8 @@ def main(argv=None):
         dataset, batch_size=1, shuffle=(sampler is None),
         sampler=sampler,
         generator=loader_generator if sampler is None else None,
-        collate_fn=lambda x: collate_fn_with_processor(x, processor, device))
+        collate_fn=lambda x: collate_fn_with_processor(
+            x, processor, device, timelens_model=args.timelens_model))
 
     text_cfg = getattr(model.config, "text_config", model.config)
     n_layers = len(model.model.language_model.layers)
@@ -1386,6 +1399,7 @@ def main(argv=None):
         "torch_version": torch.__version__,
         "numpy_version": np.__version__,
         "model_path": str(Path(args.model_path).resolve()),
+        "timelens_model": args.timelens_model,
         "attr_json": str(Path(args.attr_json).resolve()),
         "anno_json": str(Path(args.anno_json).resolve()),
         "video_dir": str(Path(args.video_dir).resolve()),
