@@ -74,16 +74,16 @@ CUDA_VISIBLE_DEVICES=0,1,2,3,4,5,6,7 torchrun --standalone --nproc_per_node 8 sc
     --timelens-model \
     --anno-json ../Lkmllm_data/datasets/Train/timelens-100k/timelens-100k.jsonl \
     --video-dir ../Lkmllm_data/datasets/Train/timelens-100k \
-    --output-dir ../Lkmllm_data/checkpoints/timelensloraceloss_2_1e_5 \
+    --output-dir ../Lkmllm_data/checkpoints/timelensloraceloss_3_5e_6 \
     --target-layers 16-23 \
     --adapt-targets q_proj v_proj o_proj \
     --lora-rank 8 \
     --lora-alpha 16 \
     --lora-dropout 0.02 \
     --max-samples-per-folder 0 \
-    --max-samples 5000 \
-    --epochs 2 \
-    --lr 1e-5 \
+    --max-samples 100000 \
+    --epochs 3 \
+    --lr 5e-6 \
     --warmup-ratio 0.1 \
     --gradient-accumulation-steps 8 \
     --grad-clip 1.0 \
@@ -148,7 +148,7 @@ CUDA_VISIBLE_DEVICES=0 python scripts/merge_m_head_lora.py \
 
 ```bash
 CUDA_VISIBLE_DEVICES=0,1,2,3,4,5,6,7 python scripts/m_e_head_eval.py \
-    --model-path ../Lkmllm_data/checkpoints/timelensloraceloss_2_1e_5 \
+    --model-path ../Lkmllm_data/checkpoints/timelensloraceloss_3_5e_6 \
     --timelens-model \
     --anno-json ../Lkmllm_data/datasets/Test/Charades_sta/charades-timelens.json \
     --video-dir ../Lkmllm_data/datasets/Test/Charades_sta/charades \
@@ -167,12 +167,12 @@ CUDA_VISIBLE_DEVICES=0,1,2,3,4,5,6,7 python scripts/m_e_head_eval.py \
 
 ```bash
 CUDA_VISIBLE_DEVICES=0,1,2,3,4,5,6,7 python scripts/m_e_head_eval.py \
-    --model-path ../Lkmllm_data/checkpoints/timelensloraceloss_2_1e_5 \
+    --model-path ../Lkmllm_data/checkpoints/timelensloraceloss_3_5e_6 \
     --timelens-model \
     --anno-json ../Lkmllm_data/datasets/Test/Activitynet/activitynet-timelens.json \
     --video-dir ../Lkmllm_data/datasets/Test/Activitynet/activitynet \
-    --output-dir ../Lkmllm_data/outputs/eval_results/timelensloraceloss_2_1e_5 \
-    --split ActivityNet_timelensloraceloss_2_1e_5 \
+    --output-dir ../Lkmllm_data/outputs/eval_results/timelensloraceloss_3_5e_6 \
+    --split ActivityNet_timelensloraceloss_3_5e_6 \
     --num-gpus 8 \
     --max-samples 0 \
     --fps 2 \
@@ -186,12 +186,12 @@ CUDA_VISIBLE_DEVICES=0,1,2,3,4,5,6,7 python scripts/m_e_head_eval.py \
 
 ```bash
 CUDA_VISIBLE_DEVICES=0,1,2,3,4,5,6,7 python scripts/m_e_head_eval.py \
-    --model-path ../Lkmllm_data/checkpoints/timelensloraceloss_2_1e_5 \
+    --model-path ../Lkmllm_data/checkpoints/timelensloraceloss_3_5e_6 \
     --timelens-model \
     --anno-json ../Lkmllm_data/datasets/Test/Qvhighlights/qvhighlights-timelens.json \
     --video-dir ../Lkmllm_data/datasets/Test/Qvhighlights/qvhighlights \
-    --output-dir ../Lkmllm_data/outputs/eval_results/timelensloraceloss_2_1e_5 \
-    --split QVHighlights_timelensloraceloss_2_1e_5 \
+    --output-dir ../Lkmllm_data/outputs/eval_results/timelensloraceloss_3_5e_6 \
+    --split QVHighlights_timelensloraceloss_3_5e_6 \
     --num-gpus 8 \
     --max-samples 0 \
     --fps 2 \
