@@ -1,12 +1,12 @@
-# TimeLens 多卡 GT-only 探测、微调与评测
+# TimeLens-8B 多卡纯 GT 探测、Top-K HeadLoRA 微调与评测
 
 本文档对应三个脚本：
 
-- `scripts/m_d_startend_gradient_head_attribution.py`：TimeLens-8B 纯 GT 对齐分数探测（直接复制 new 方法的独立实现，不 import new 脚本，不再使用梯度归因）。
-- `scripts/m_heads_finetune_layer_lora_attn_align.py`：TimeLens 时间戳 CE-only 多卡 LoRA 微调。
+- `scripts/m_d_startend_gradient_head_attribution.py`：TimeLens-8B 纯 GT attention 对齐分数探测，不使用 video token mass 候选筛选。
+- `scripts/m_heads_finetune_layer_lora_attn_align.py`：仅对 GT 排名 Top-K heads 做 masked LoRA 微调。
 - `scripts/m_e_head_eval.py`：对微调后的完整模型或基线模型生成预测，评测 IoU / Recall。
 
-三个阶段均保持每张 GPU 加载一份完整模型、分摊不同样本，不跨 GPU 分片。微调同步梯度；探测和评测汇总各卡结果。评测不再读取 head JSON，也不以 GT 分数替代定位指标。
+三个阶段均保持每张 GPU 加载一份完整模型、分摊不同样本，不跨 GPU 分片。探测恢复稳定的旧输入路径：先按 FPS 抽取 PIL 帧并保留原始帧索引/FPS，再交给 `qwen_vl_utils.process_vision_info`。微调和评测仍把视频路径直接交给 Qwen utils。
 
 ## 1. 本次实验配置
 
@@ -19,7 +19,7 @@
 | 微调样本 | 全部 GPU 合计最多 5000 |
 | epochs | 2 |
 | learning rate | 1e-5 |
-| target layers | 16-23 |
+| 微调目标 | GT 对齐 Top-20 heads（不是整层） |
 | LoRA targets | q_proj、v_proj、o_proj |
 | LoRA rank / alpha / dropout | 8 / 16 / 0.02 |
 | gradient accumulation / clip | 8 / 1.0 |
@@ -30,15 +30,15 @@
 
 必须设置 `--max-samples-per-folder 0`，才能让 `--max-samples 5000` 生效。5000 不是每卡样本数；加载满 5000 条时每卡每轮为 625 条。有效全局 batch 为 `8 × 1 × 8 = 64`（完整累积窗口）。
 
-当前只优化时间戳数字 token 的 CE。保留此前的层级 LoRA 配置：16–23 层全部 head 的 q/v/o 投影参与适配；固定层模式不使用 GT 排名。若需要按 GT Top-K head 选择 LoRA 范围，使用 `--target-layers "" --top-k 20`。
+当前只优化时间戳数字 token 的 CE。微调从探测 JSON 的 `gt_alignment_top_heads` 读取前 `--top-k` 个 head，只更新这些 head 对应的 q/v/o masked LoRA；不再提供 `--target-layers` 整层覆盖模式。
 
 所有命令均在服务器的 `Lkmllm_code` 目录下运行。续行缩进四个空格，反斜杠必须是行末最后一个字符。
 
 ## 2. 八卡纯 GT 对齐 Head 探测
 
-探测模型使用 `../shared_models/TimeLens-8B`。脚本默认启用 TimeLens prompt 和 processor 设置（`padding_side="left"`、`do_resize=False`），不强制覆盖处理器的视觉缩放尺寸。探测和微调均使用同一份 TimeLens-8B 基础权重。
+探测模型使用 `../shared_models/TimeLens-8B`，并传入 `--timelens-model` 启用 TimeLens 官方单 user-turn prompt。
 
-只计算时间戳 query 的 GT attention mass，经视频 attention mass 和均匀基线归一化得到 GT 对齐分数。不做 backward，不使用梯度归因、联合筛选或层间归一化联合排名。主模型使用 SDPA，hook 单独计算时间戳 query 对应的 attention 行。
+只计算时间戳 query 的 GT attention 对齐分数。不做 backward，不使用梯度归因、联合分数、层间归一化，也不先取 video token attention mass 前20%候选池。所有有效 heads 直接按 GT 对齐分数降序排名。
 
 ```bash
 CUDA_VISIBLE_DEVICES=0,1,2,3,4,5,6,7 torchrun --standalone --nproc_per_node 8 scripts/m_d_startend_gradient_head_attribution.py \
@@ -46,11 +46,12 @@ CUDA_VISIBLE_DEVICES=0,1,2,3,4,5,6,7 torchrun --standalone --nproc_per_node 8 sc
     --model-path ../shared_models/TimeLens-8B \
     --timelens-model \
     --video-dir ../Lkmllm_data/datasets/Train/timelens-100k \
-    --output-dir ../Lkmllm_data/outputs/m_timelens_head_attr_gt_only_500 \
+    --output-dir ../Lkmllm_data/outputs/m_timelens_gt_only_500 \
     --max-samples 500 \
     --max-duration 0 \
     --top-k 30 \
     --fps 2 \
+    --max-frames 0 \
     --min-tokens 64 \
     --total-tokens 14336
 ```
@@ -58,32 +59,32 @@ CUDA_VISIBLE_DEVICES=0,1,2,3,4,5,6,7 torchrun --standalone --nproc_per_node 8 sc
 每个 rank 处理候选集合的 `rank::world_size` 切片。Rank 0 按有效样本数加权合并后，只保留最终文件：
 
 ```text
-../Lkmllm_data/outputs/m_timelens_head_attr_gt_only_500/video_only_head_attribution.json
+../Lkmllm_data/outputs/m_timelens_gt_only_500/video_only_head_attribution.json
 ```
 
-文件包含 `video_only_top_heads`、`gt_alignment_score_matrix` 和有效样本计数。微调只需这一个 JSON。临时 rank 结果在合并成功后清理。
+文件包含 `gt_alignment_top_heads`、`gt_alignment_score_matrix` 和有效样本计数。为兼容旧工具，同一排名也写入 `video_only_top_heads`，但 `_meta.video_mass_candidate_filter=false` 表示没有 video mass 前筛选。
 
-不再传 `--layers-per-batch` 或 `--max-frames 448`；新探测入口没有这两个参数。2 FPS 采样后不额外截帧，仍保留视觉 token 预算。
+`--max-frames 0` 表示不额外限帧。探测先按 2 FPS 抽帧，再由 `qwen_vl_utils` 处理 pixel budget 和视觉 tensor。
 
 ## 3. 八卡微调：5000 样本 × 2 轮
 
 ```bash
 CUDA_VISIBLE_DEVICES=0,1,2,3,4,5,6,7 torchrun --standalone --nproc_per_node 8 scripts/m_heads_finetune_layer_lora_attn_align.py \
-    --attr-json ../Lkmllm_data/outputs/m_timelens_head_attr_gt_only_500/video_only_head_attribution.json \
+    --attr-json ../Lkmllm_data/outputs/m_timelens_gt_only_500/video_only_head_attribution.json \
     --model-path ../shared_models/TimeLens-8B \
     --timelens-model \
     --anno-json ../Lkmllm_data/datasets/Train/timelens-100k/timelens-100k.jsonl \
     --video-dir ../Lkmllm_data/datasets/Train/timelens-100k \
-    --output-dir ../Lkmllm_data/checkpoints/timelensloraceloss_3_5e_6 \
-    --target-layers 16-23 \
+    --output-dir ../Lkmllm_data/checkpoints/timelens_gt_top20_ce_2ep \
+    --top-k 20 \
     --adapt-targets q_proj v_proj o_proj \
     --lora-rank 8 \
     --lora-alpha 16 \
     --lora-dropout 0.02 \
     --max-samples-per-folder 0 \
-    --max-samples 100000 \
-    --epochs 3 \
-    --lr 5e-6 \
+    --max-samples 5000 \
+    --epochs 2 \
+    --lr 1e-5 \
     --warmup-ratio 0.1 \
     --gradient-accumulation-steps 8 \
     --grad-clip 1.0 \
@@ -96,10 +97,10 @@ CUDA_VISIBLE_DEVICES=0,1,2,3,4,5,6,7 torchrun --standalone --nproc_per_node 8 sc
 
 ## 4. 微调权重保存与恢复
 
-训练和下文微调评测统一使用短目录名 `timelensloraceloss_2_1e_5`：
+训练和下文微调评测统一使用目录名 `timelens_gt_top20_ce_2ep`：
 
 ```text
-../Lkmllm_data/checkpoints/timelensloraceloss_2_1e_5/
+../Lkmllm_data/checkpoints/timelens_gt_top20_ce_2ep/
 ├── lora_layer_checkpoint.pt   # 最新训练断点；完成后保留
 ├── lora_epoch_001.pt          # 第 1 轮轻量 checkpoint
 ├── lora_epoch_002.pt          # 第 2 轮轻量 checkpoint
@@ -110,7 +111,7 @@ CUDA_VISIBLE_DEVICES=0,1,2,3,4,5,6,7 torchrun --standalone --nproc_per_node 8 sc
 └── processor/tokenizer files
 ```
 
-目录名中的 `2` 表示训练 2 轮，`1e_5` 表示学习率 `1e-5`。这里更新的是命令中的输出路径，不会重命名磁盘上已有权重。不要从旧 Qwen3 base 微调目录或旧的 `align001` 目录恢复本次 TimeLens 实验；如需恢复本次实验，使用原参数和本次输出目录重启。
+本目录对应 TimeLens-8B 上的纯 GT Top-20 HeadLoRA。不要从旧整层 LoRA、Qwen base 或 alignment-loss 实验目录恢复。
 
 正常完成后，评测的 `--model-path` 指向整个保存目录，不是单独的 adapter 或某个 safetensors 分片。
 
@@ -126,13 +127,13 @@ alignment loss 和相关 hook 已从多卡脚本删除，不再接受 `--align-w
 
 ```bash
 CUDA_VISIBLE_DEVICES=0 python scripts/merge_m_head_lora.py \
-    --checkpoint ../Lkmllm_data/checkpoints/timelensloraceloss_2_1e_5/lora_epoch_002.pt \
+    --checkpoint ../Lkmllm_data/checkpoints/timelens_gt_top20_ce_2ep/lora_epoch_002.pt \
     --model-path ../shared_models/TimeLens-8B \
-    --output-dir ../shared_models/timelensloraceloss_2_1e_5 \
+    --output-dir ../shared_models/timelens_gt_top20_ce_2ep \
     --device cuda:0
 ```
 
-必须加载训练时同一份原始 TimeLens 权重，不能加载已合并过 LoRA 的模型，否则会叠加更新。也可用 `--device cpu`，无需 GPU，但需要足够的主机内存。导出目录必须是新目录或空目录。评测这一轮时，将下方命令的 `--model-path` 改为 `../shared_models/timelensloraceloss_2_1e_5`，并为 `--split` 加上 `epoch002`，保留 `--timelens-model`。旧 checkpoint 若没有 `adapter_config`，此工具会报错，不会猜测配置。
+必须加载训练时同一份 TimeLens-8B 原始权重，不能加载已合并过 LoRA 的模型，否则会叠加更新。导出目录必须是新目录或空目录。TimeLens 主实验的评测命令保留 `--timelens-model`。
 
 ## 5. 八卡评测指令
 
@@ -142,18 +143,18 @@ CUDA_VISIBLE_DEVICES=0 python scripts/merge_m_head_lora.py \
 
 所有命令显式评完整测试集（`--max-samples 0`），并使用相同的视频输入参数。微调、base 和 TimeLens 分开保存结果，且每个 `--split` 同时标记数据集和模型，避免覆盖或混淆。若要复现历史 500 样本实验，请将对比各组都改成 `--max-samples 500` 并使用独立输出目录。
 
-### 5.1 TimeLens-8B：CE-only LoRA 微调模型
+### 5.1 TimeLens-8B：纯 GT Top-20 HeadLoRA 微调模型
 
 #### Charades-STA-TimeLens
 
 ```bash
 CUDA_VISIBLE_DEVICES=0,1,2,3,4,5,6,7 python scripts/m_e_head_eval.py \
-    --model-path ../Lkmllm_data/checkpoints/timelensloraceloss_3_5e_6 \
+    --model-path ../Lkmllm_data/checkpoints/timelens_gt_top20_ce_2ep \
     --timelens-model \
     --anno-json ../Lkmllm_data/datasets/Test/Charades_sta/charades-timelens.json \
     --video-dir ../Lkmllm_data/datasets/Test/Charades_sta/charades \
-    --output-dir ../Lkmllm_data/outputs/eval_results/timelensloraceloss_2_1e_5 \
-    --split Charades_timelensloraceloss_2_1e_5 \
+    --output-dir ../Lkmllm_data/outputs/eval_results/timelens_gt_top20_ce_2ep \
+    --split Charades_timelens_gt_top20_ce_2ep \
     --num-gpus 8 \
     --max-samples 0 \
     --fps 2 \
@@ -167,12 +168,12 @@ CUDA_VISIBLE_DEVICES=0,1,2,3,4,5,6,7 python scripts/m_e_head_eval.py \
 
 ```bash
 CUDA_VISIBLE_DEVICES=0,1,2,3,4,5,6,7 python scripts/m_e_head_eval.py \
-    --model-path ../Lkmllm_data/checkpoints/timelensloraceloss_3_5e_6 \
+    --model-path ../Lkmllm_data/checkpoints/timelens_gt_top20_ce_2ep \
     --timelens-model \
     --anno-json ../Lkmllm_data/datasets/Test/Activitynet/activitynet-timelens.json \
     --video-dir ../Lkmllm_data/datasets/Test/Activitynet/activitynet \
-    --output-dir ../Lkmllm_data/outputs/eval_results/timelensloraceloss_3_5e_6 \
-    --split ActivityNet_timelensloraceloss_3_5e_6 \
+    --output-dir ../Lkmllm_data/outputs/eval_results/timelens_gt_top20_ce_2ep \
+    --split ActivityNet_timelens_gt_top20_ce_2ep \
     --num-gpus 8 \
     --max-samples 0 \
     --fps 2 \
@@ -186,12 +187,12 @@ CUDA_VISIBLE_DEVICES=0,1,2,3,4,5,6,7 python scripts/m_e_head_eval.py \
 
 ```bash
 CUDA_VISIBLE_DEVICES=0,1,2,3,4,5,6,7 python scripts/m_e_head_eval.py \
-    --model-path ../Lkmllm_data/checkpoints/timelensloraceloss_3_5e_6 \
+    --model-path ../Lkmllm_data/checkpoints/timelens_gt_top20_ce_2ep \
     --timelens-model \
     --anno-json ../Lkmllm_data/datasets/Test/Qvhighlights/qvhighlights-timelens.json \
     --video-dir ../Lkmllm_data/datasets/Test/Qvhighlights/qvhighlights \
-    --output-dir ../Lkmllm_data/outputs/eval_results/timelensloraceloss_3_5e_6 \
-    --split QVHighlights_timelensloraceloss_3_5e_6 \
+    --output-dir ../Lkmllm_data/outputs/eval_results/timelens_gt_top20_ce_2ep \
+    --split QVHighlights_timelens_gt_top20_ce_2ep \
     --num-gpus 8 \
     --max-samples 0 \
     --fps 2 \
@@ -330,10 +331,9 @@ CUDA_VISIBLE_DEVICES=0,1,2,3,4,5,6,7 python scripts/m_e_head_eval.py \
 |---|---:|---:|---:|---:|
 | ActivityNet-base | 62.1 | 51.2 | 34.4 | 46.8 |
 | Charades-base | 69.2 | 53.4 | 27.5 | 48.4 |
-|  Charades-TOPKLora | 73.3 | 57.95 | 30.1 | 50.8 |
+| Charades-TOPKLora | 73.3 | 57.95 | 30.1 | 50.8 |
 | QVHighlights-base | 69.4 | 60.35 | 46.9 | 57.6 |
 | QVHighlights-TOPKLora | 74.5 | 65.54 | 50.7 | 61.39 |
-
 
 ### 500样本base模型和topk对比结果
 
