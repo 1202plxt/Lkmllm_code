@@ -330,6 +330,7 @@ CUDA_VISIBLE_DEVICES=0,1,2,3,4,5,6,7 python scripts/m_e_head_eval.py \
 | 测试集 | R@0.3 | R@0.5 | R@0.7 | mIoU |
 |---|---:|---:|---:|---:|
 | ActivityNet-base | 62.1 | 51.2 | 34.4 | 46.8 |
+| ActivityNet-TOPKLora | 63.9 | 53.8 | 35.1 | 48.4 |
 | Charades-base | 69.2 | 53.4 | 27.5 | 48.4 |
 | Charades-TOPKLora | 73.3 | 57.95 | 30.1 | 50.8 |
 | QVHighlights-base | 69.4 | 60.35 | 46.9 | 57.6 |
