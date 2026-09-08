@@ -324,7 +324,7 @@ CUDA_VISIBLE_DEVICES=0,1,2,3,4,5,6,7 python scripts/m_e_head_eval.py \
 以下保留你提供的历史结果数值，不代表本次 GT-only、5000 样本 × 2 轮实验的结果。原表混合了参考值和本地 topk 实验记录，未在本次修改中重新核验来源。
 
 原文引用：[TimeLens 官方项目](https://github.com/pkuhxy/Timelens) 和 [TimeLens-8B 模型说明](https://huggingface.co/TencentARC/TimeLens-8B) 。R 指标均为 R@1；第一、第三张表使用百分数，500 样本对照表使用 0–1 小数。
-
+2000训练样本微调top20heads，2epoch
 ### Qwen3-VL-8B-Instruct base /topk
 
 | 测试集 | R@0.3 | R@0.5 | R@0.7 | mIoU |
@@ -346,7 +346,7 @@ CUDA_VISIBLE_DEVICES=0,1,2,3,4,5,6,7 python scripts/m_e_head_eval.py \
 |Activitynet_base|	0.458|	0.364|	0.244|	0.3546|
 |Activitynet_topk	|0.536|	0.458|	0.336|	0.4294|
 
-
+2000样本微调top20 head 1epoch
 ### TimeLens-8B
 
 | 测试集 | R@0.3 | R@0.5 | R@0.7 | mIoU |
