@@ -334,7 +334,7 @@ CUDA_VISIBLE_DEVICES=0,1,2,3,4,5,6,7 python scripts/m_e_head_eval.py \
 | Charades-base | 69.2 | 53.4 | 27.5 | 48.4 |
 | Charades-TOPKLora | 73.3 | 57.95 | 30.1 | 50.8 |
 | QVHighlights-base | 74.2 | 64.6 | 49.3 | 59.4 |
-| QVHighlights-TOPKLora | 74.5 | 65.54 | 50.7 | 61.39 |
+| QVHighlights-TOPKLora | 77.1 | 67.8 | 51.8 | 62.3 |
 
 ### 500样本base模型和topk对比结果
 
