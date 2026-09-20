@@ -333,7 +333,7 @@ CUDA_VISIBLE_DEVICES=0,1,2,3,4,5,6,7 python scripts/m_e_head_eval.py \
 | ActivityNet-TOPKLora | 63.9 | 53.8 | 35.1 | 48.4 |
 | Charades-base | 69.2 | 53.4 | 27.5 | 48.4 |
 | Charades-TOPKLora | 73.3 | 57.95 | 30.1 | 50.8 |
-| QVHighlights-base | 69.4 | 60.35 | 46.9 | 57.6 |
+| QVHighlights-base | 74.2 | 64.6 | 49.3 | 59.4 |
 | QVHighlights-TOPKLora | 74.5 | 65.54 | 50.7 | 61.39 |
 
 ### 500样本base模型和topk对比结果
